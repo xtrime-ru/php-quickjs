@@ -39,4 +39,28 @@ $deep = 1;
 for ($i = 0; $i < 66; $i++) { $deep = [$deep]; }
 throws(fn() => $send->dispatch(['deep', $deep]), Throwable::class, 'PHP input depth bounded');
 eq([['ok', 2]], $send->dispatch(['ok', 2])['messages'], 'conversion failures leave usable batch');
+
+eq('?array', (string) (new ReflectionMethod($send, 'dispatch'))->getParameters()[0]->getType(), 'native argument type matches contract');
+throws(fn() => $send->dispatch(['callback', fn() => 1]), Throwable::class, 'direct input rejects PHP closures');
+throws(fn() => $send->dispatch(['callback', $send]), Throwable::class, 'direct input rejects JS callbacks');
+throws(fn() => $send->dispatch(['large', str_repeat('x', 16777217)]), Throwable::class, 'direct input byte budget enforced');
+$captured = new stdClass();
+$weak = WeakReference::create($captured);
+$closure = fn() => $captured;
+try { $send->dispatch(['named' => $closure]); } catch (Throwable) {}
+unset($closure, $captured);
+eq(null, $weak->get(), 'invalid direct arguments retain no PHP closures');
+$getterEmit = $q->eval('() => __quickjsEmit("outer", {get value() { __quickjsEmit("inner", 1); return 2; }})');
+eq([['inner', 1], ['outer', ['value' => 2]]], $getterEmit->dispatch([])['messages'], 'getter can emit without borrowing active queue');
+$short = new QuickJS(timeoutMs: 20);
+$effects = 0;
+$short->register('slow', fn() => usleep(50000));
+$short->register('effect', function () use (&$effects) { $effects++; });
+$late = $short->eval('() => { Promise.resolve().then(() => php.effect()); php.slow(); }');
+throws(fn() => $late->dispatch([]), QuickJSTimeoutException::class, 'expired invocation does not start first job');
+eq(0, $effects, 'expired dispatch has no job side effects');
+eq(true, $short->hasPendingJobs(), 'timed out dispatch preserves pending jobs');
+$late->dispatch(null);
+eq(1, $effects, 'caller can explicitly resume pending jobs');
+
 done();

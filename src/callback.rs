@@ -6,9 +6,11 @@
 //! is already in flight, else acquiring the runtime lock afresh.
 
 use crate::engine::Engine;
-use crate::marshal::{middle_to_js, middle_to_zval, zval_to_middle, MiddleValue};
+use crate::marshal::{
+    arguments_to_middle, data_arguments, middle_to_js, middle_to_zval, MiddleValue,
+};
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::Zval;
+use ext_php_rs::types::{ZendHashTable, Zval};
 use rquickjs::{Ctx, Function, TypedArray, Value};
 use std::rc::Rc;
 
@@ -41,10 +43,8 @@ impl JsCallback {
     fn invoke_inner(&self, args: &[&Zval]) -> PhpResult<Zval> {
         let _guard = self.engine.enter().map_err(PhpException::default)?;
 
-        let mut middle_args = Vec::with_capacity(args.len());
-        for a in args {
-            middle_args.push(zval_to_middle(a, &self.engine.state).map_err(PhpException::default)?);
-        }
+        let middle_args =
+            arguments_to_middle(args, &self.engine.state).map_err(PhpException::default)?;
         let payload = MiddleValue::Array(middle_args)
             .to_msgpack()
             .map_err(|e| PhpException::default(e.to_string()))?;
@@ -79,9 +79,7 @@ impl JsCallback {
                 "JS callback invoked outside its eval (isolated QuickJS instance)".to_owned(),
             ));
         }
-        self.engine
-            .eval_in(run)
-            .map_err(|e| PhpException::default(e.to_string()))?
+        self.engine.eval_in(run)
     }
 }
 
@@ -91,7 +89,7 @@ impl JsCallback {
     /// instead of an argument list to continue jobs without invoking the callback.
     /// Returns queued messages, executed job count, and pending-job status.
     #[php(defaults(maxJobs = 100))]
-    pub fn dispatch(&self, args: &Zval, maxJobs: i64) -> PhpResult<Zval> {
+    pub fn dispatch(&self, args: Option<&ZendHashTable>, maxJobs: i64) -> PhpResult<Zval> {
         if maxJobs <= 0 {
             return Err(PhpException::default(
                 "maxJobs must be greater than zero".to_owned(),
@@ -107,58 +105,49 @@ impl JsCallback {
                 "Cannot dispatch while JavaScript is executing".to_owned(),
             ));
         }
-        let middle = zval_to_middle(args, &self.engine.state).map_err(PhpException::default)?;
-        if !matches!(middle, MiddleValue::Null | MiddleValue::Array(_)) {
-            return Err(PhpException::default(
-                "args must be a list or null".to_owned(),
-            ));
-        }
+        let middle = args
+            .map(|args| data_arguments(args, &self.engine.state))
+            .transpose()
+            .map_err(PhpException::default)?;
         let _guard = self.engine.enter().map_err(PhpException::default)?;
-        self.engine.state.collecting.set(true);
-        let _messages = MessageGuard {
-            state: &self.engine.state,
-        };
-        self.engine
-            .eval_in(|ctx| {
-                if let MiddleValue::Array(items) = &middle {
-                    let get: Function = ctx
-                        .globals()
-                        .get("__getJsFn")
-                        .map_err(|e| self.engine.callback_error(ctx, e))?;
-                    let fun: Function = get
-                        .call((self.id as f64,))
-                        .map_err(|e| self.engine.callback_error(ctx, e))?;
-                    let mut call_args = rquickjs::function::Args::new(ctx.clone(), items.len());
-                    for item in items {
-                        call_args
-                            .push_arg(
-                                middle_to_js(ctx, item, &self.engine.state)
-                                    .map_err(|e| self.engine.callback_error(ctx, e))?,
-                            )
-                            .map_err(|e| self.engine.callback_error(ctx, e))?;
-                    }
-                    // Dispatch is a notification; its return value is deliberately ignored.
-                    fun.call_arg::<Value>(call_args)
+        let _batch = self.engine.state.begin_batch();
+        self.engine.eval_in(|ctx| {
+            if let Some(MiddleValue::Array(items)) = &middle {
+                let get: Function = ctx
+                    .globals()
+                    .get("__getJsFn")
+                    .map_err(|e| self.engine.callback_error(ctx, e))?;
+                let fun: Function = get
+                    .call((self.id as f64,))
+                    .map_err(|e| self.engine.callback_error(ctx, e))?;
+                let mut call_args = rquickjs::function::Args::new(ctx.clone(), items.len());
+                for item in items {
+                    call_args
+                        .push_arg(
+                            middle_to_js(ctx, item, &self.engine.state)
+                                .map_err(|e| self.engine.callback_error(ctx, e))?,
+                        )
                         .map_err(|e| self.engine.callback_error(ctx, e))?;
                 }
-                let jobs = self.engine.run_jobs(ctx, maxJobs)?;
-                let pending = unsafe {
-                    rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(
-                        ctx.as_raw().as_ptr(),
-                    ))
-                };
-                let messages = std::mem::take(&mut *self.engine.state.messages.borrow_mut());
-                middle_to_zval(
-                    &MiddleValue::Map(vec![
-                        ("messages".to_owned(), MiddleValue::Array(messages)),
-                        ("jobs".to_owned(), MiddleValue::Int(jobs)),
-                        ("pending".to_owned(), MiddleValue::Bool(pending)),
-                    ]),
-                    &self.engine.state,
-                )
-                .map_err(PhpException::default)
-            })
-            .map_err(|e| PhpException::default(e.to_string()))?
+                // Dispatch is a notification; its return value is deliberately ignored.
+                fun.call_arg::<Value>(call_args)
+                    .map_err(|e| self.engine.callback_error(ctx, e))?;
+            }
+            let jobs = self.engine.run_jobs(ctx, maxJobs)?;
+            let pending = unsafe {
+                rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()))
+            };
+            let messages = self.engine.state.take_messages();
+            middle_to_zval(
+                &MiddleValue::Map(vec![
+                    ("messages".to_owned(), MiddleValue::Array(messages)),
+                    ("jobs".to_owned(), MiddleValue::Int(jobs)),
+                    ("pending".to_owned(), MiddleValue::Bool(pending)),
+                ]),
+                &self.engine.state,
+            )
+            .map_err(PhpException::default)
+        })
     }
 
     /// Invoke the JS callback: `$cb(...$args)`.
@@ -169,17 +158,5 @@ impl JsCallback {
     /// Explicit form: `$cb->call([...$args])`.
     pub fn call(&self, args: &[&Zval]) -> PhpResult<Zval> {
         self.invoke_inner(args)
-    }
-}
-
-/// Clear partial output on failure as well as successful drains.
-struct MessageGuard<'a> {
-    state: &'a crate::bridge::BridgeState,
-}
-impl Drop for MessageGuard<'_> {
-    fn drop(&mut self) {
-        self.state.collecting.set(false);
-        self.state.messages.borrow_mut().clear();
-        self.state.message_bytes.set(0);
     }
 }

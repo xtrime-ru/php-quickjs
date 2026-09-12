@@ -205,122 +205,173 @@ impl<'de> Deserialize<'de> for MapKey {
 // JS <-> MiddleValue
 // ---------------------------------------------------------------------------
 
-/// Convert a JS value into the neutral representation. Functions are registered
-/// in the JS-side registry and travel as a [`MiddleValue::JsFn`] ref.
-pub fn js_to_middle<'js>(
-    ctx: &Ctx<'js>,
-    value: Value<'js>,
-    _state: &BridgeState,
-) -> rquickjs::Result<MiddleValue> {
-    js_to_middle_bounded(ctx, value, _state, 0, &mut 16_777_216, true)
+pub const MAX_VALUE_DEPTH: usize = 64;
+pub const MAX_DATA_BYTES: usize = 16 * 1024 * 1024;
+pub const VALUE_OVERHEAD: usize = 64;
+
+/// The direct transport has a byte budget; the generic API keeps its previous
+/// unlimited byte size. Both paths bound recursion before visiting a value.
+#[derive(Default)]
+struct ConversionBudget {
+    limit: Option<usize>,
+    used: usize,
+}
+impl ConversionBudget {
+    fn direct() -> Self {
+        Self {
+            limit: Some(MAX_DATA_BYTES),
+            used: 0,
+        }
+    }
+    fn remaining(&self) -> Option<usize> {
+        self.limit.map(|limit| limit - self.used)
+    }
+    fn charge(&mut self, bytes: usize) -> Result<(), &'static str> {
+        let used = self
+            .used
+            .checked_add(bytes)
+            .ok_or("bridge value exceeds size limit")?;
+        if self.limit.is_some_and(|limit| used > limit) {
+            return Err("bridge value exceeds size limit");
+        }
+        self.used = used;
+        Ok(())
+    }
+    fn node(&mut self, depth: usize) -> Result<(), &'static str> {
+        if depth > MAX_VALUE_DEPTH {
+            return Err("bridge value exceeds maximum depth (64)");
+        }
+        self.charge(VALUE_OVERHEAD)
+    }
 }
 
-/// Direct messages accept data only and share one allocation budget per payload.
-pub fn js_to_data<'js>(
+/// Failed conversion never hands the registered functions to PHP. Defer their
+/// deletion just like dropped wrappers, without executing JS during unwinding.
+pub fn js_to_middle<'js>(
     ctx: &Ctx<'js>,
     value: Value<'js>,
     state: &BridgeState,
 ) -> rquickjs::Result<MiddleValue> {
-    js_to_middle_bounded(ctx, value, state, 0, &mut 16_777_216, false)
+    let mut conversion = JsConversion {
+        ctx,
+        budget: ConversionBudget::default(),
+        functions: true,
+        registered: Vec::new(),
+    };
+    let result = conversion.convert(value, 0);
+    if result.is_err() {
+        for id in conversion.registered {
+            state.queue_fn_deletion(id);
+        }
+    }
+    result
 }
 
-fn js_to_middle_bounded<'js>(
+/// Return the accounted size together with data, without traversing it twice.
+pub fn js_to_data<'js>(
     ctx: &Ctx<'js>,
     value: Value<'js>,
-    _state: &BridgeState,
-    depth: usize,
-    budget: &mut usize,
+) -> rquickjs::Result<(MiddleValue, usize)> {
+    let mut conversion = JsConversion {
+        ctx,
+        budget: ConversionBudget::direct(),
+        functions: false,
+        registered: Vec::new(),
+    };
+    let data = conversion.convert(value, 0)?;
+    Ok((data, conversion.budget.used))
+}
+
+struct JsConversion<'a, 'js> {
+    ctx: &'a Ctx<'js>,
+    budget: ConversionBudget,
     functions: bool,
-) -> rquickjs::Result<MiddleValue> {
-    if depth > 64 || *budget < 64 {
-        return Err(rquickjs::Exception::throw_type(
-            ctx,
-            "bridge value exceeds depth or size limit",
-        ));
-    }
-    *budget -= 64;
-    if value.is_null() || value.is_undefined() {
-        return Ok(MiddleValue::Null);
-    }
-    if let Some(b) = value.as_bool() {
-        return Ok(MiddleValue::Bool(b));
-    }
-    if value.is_int() {
-        return Ok(MiddleValue::Int(value.as_int().unwrap() as i64));
-    }
-    if value.is_float() {
-        return Ok(int_or_float(value.as_float().unwrap()));
-    }
-    if let Some(s) = value.as_string() {
-        let text = s.to_string()?;
-        *budget = budget.checked_sub(text.len()).ok_or_else(|| {
-            rquickjs::Exception::throw_type(ctx, "bridge value exceeds size limit")
-        })?;
-        return Ok(MiddleValue::Str(text));
-    }
-    if value.is_function() {
-        if !functions {
-            return Err(rquickjs::Exception::throw_type(
-                ctx,
-                "direct messages cannot contain functions",
-            ));
+    registered: Vec<u64>,
+}
+impl<'js> JsConversion<'_, 'js> {
+    fn convert(&mut self, value: Value<'js>, depth: usize) -> rquickjs::Result<MiddleValue> {
+        let ctx = self.ctx;
+        self.budget
+            .node(depth)
+            .map_err(|e| rquickjs::Exception::throw_type(ctx, e))?;
+        if value.is_null() || value.is_undefined() {
+            return Ok(MiddleValue::Null);
         }
-        // Register the function JS-side; PHP receives an opaque id.
-        let register: Function = ctx.globals().get("__registerJsFn")?;
-        let id: f64 = register.call((value.clone(),))?;
-        return Ok(MiddleValue::JsFn(id as u64));
-    }
-    // Uint8Array -> Bytes (checked before the generic object branch).
-    if value.is_object() {
-        if let Ok(ta) = TypedArray::<u8>::from_value(value.clone()) {
-            if let Some(bytes) = ta.as_bytes() {
-                *budget = budget.checked_sub(bytes.len()).ok_or_else(|| {
-                    rquickjs::Exception::throw_type(ctx, "bridge value exceeds size limit")
-                })?;
-                return Ok(MiddleValue::Bytes(bytes.to_vec()));
+        if let Some(b) = value.as_bool() {
+            return Ok(MiddleValue::Bool(b));
+        }
+        if value.is_int() {
+            return Ok(MiddleValue::Int(value.as_int().unwrap() as i64));
+        }
+        if value.is_float() {
+            return Ok(int_or_float(value.as_float().unwrap()));
+        }
+        if let Some(s) = value.as_string() {
+            let text = s.to_string()?;
+            self.budget
+                .charge(text.len())
+                .map_err(|e| rquickjs::Exception::throw_type(ctx, e))?;
+            return Ok(MiddleValue::Str(text));
+        }
+        if value.is_function() {
+            if !self.functions {
+                return Err(rquickjs::Exception::throw_type(
+                    ctx,
+                    "direct messages cannot contain functions",
+                ));
+            }
+            // Register the function JS-side; PHP receives an opaque id.
+            let register: Function = ctx.globals().get("__registerJsFn")?;
+            let id: f64 = register.call((value.clone(),))?;
+            self.registered.push(id as u64);
+            return Ok(MiddleValue::JsFn(id as u64));
+        }
+        // Uint8Array -> Bytes (checked before the generic object branch).
+        if value.is_object() {
+            if let Ok(ta) = TypedArray::<u8>::from_value(value.clone()) {
+                if let Some(bytes) = ta.as_bytes() {
+                    self.budget
+                        .charge(bytes.len())
+                        .map_err(|e| rquickjs::Exception::throw_type(ctx, e))?;
+                    return Ok(MiddleValue::Bytes(bytes.to_vec()));
+                }
             }
         }
-    }
-    if value.is_array() {
-        let arr = value.into_array().unwrap();
-        if arr.len() > *budget / 64 {
-            return Err(rquickjs::Exception::throw_type(
-                ctx,
-                "bridge array exceeds size limit",
-            ));
+        if value.is_array() {
+            let arr = value.into_array().unwrap();
+            if self
+                .budget
+                .remaining()
+                .is_some_and(|remaining| arr.len() > remaining / VALUE_OVERHEAD)
+            {
+                return Err(rquickjs::Exception::throw_type(
+                    ctx,
+                    "bridge array exceeds size limit",
+                ));
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                out.push(self.convert(arr.get(i)?, depth + 1)?);
+            }
+            return Ok(MiddleValue::Array(out));
         }
-        let mut out = Vec::with_capacity(arr.len());
-        for i in 0..arr.len() {
-            out.push(js_to_middle_bounded(
-                ctx,
-                arr.get(i)?,
-                _state,
-                depth + 1,
-                budget,
-                functions,
-            )?);
+        if value.is_object() {
+            let obj = value.into_object().unwrap();
+            let mut out = Vec::new();
+            for entry in obj.props::<String, Value>() {
+                let (k, v) = entry?;
+                self.budget
+                    .charge(k.len())
+                    .map_err(|e| rquickjs::Exception::throw_type(ctx, e))?;
+                out.push((k, self.convert(v, depth + 1)?));
+            }
+            return Ok(MiddleValue::Map(out));
         }
-        return Ok(MiddleValue::Array(out));
+        Err(rquickjs::Exception::throw_type(
+            ctx,
+            "unsupported JS value type",
+        ))
     }
-    if value.is_object() {
-        let obj = value.into_object().unwrap();
-        let mut out = Vec::new();
-        for entry in obj.props::<String, Value>() {
-            let (k, v) = entry?;
-            *budget = budget.checked_sub(k.len()).ok_or_else(|| {
-                rquickjs::Exception::throw_type(ctx, "bridge value exceeds size limit")
-            })?;
-            out.push((
-                k,
-                js_to_middle_bounded(ctx, v, _state, depth + 1, budget, functions)?,
-            ));
-        }
-        return Ok(MiddleValue::Map(out));
-    }
-    Err(rquickjs::Exception::throw_type(
-        ctx,
-        "unsupported JS value type",
-    ))
 }
 
 /// Convert the neutral representation into a JS value.
@@ -373,85 +424,130 @@ pub fn middle_to_js<'js>(
 // PHP Zval <-> MiddleValue
 // ---------------------------------------------------------------------------
 
-/// Convert a PHP value into the neutral representation. A `Js\Callback` becomes
-/// a [`MiddleValue::JsFn`] ref; any other PHP callable is registered host-side
-/// as a [`MiddleValue::PhpFn`].
+/// Registrations are committed only once the complete input is valid.
 pub fn zval_to_middle(zv: &Zval, state: &BridgeState) -> Result<MiddleValue, String> {
-    zval_to_middle_depth(zv, state, 0)
+    let mut conversion = PhpConversion::new(state, true);
+    let value = conversion.convert(zv, 0)?;
+    conversion.registered.clear();
+    Ok(value)
 }
 
-fn zval_to_middle_depth(
-    zv: &Zval,
+pub fn arguments_to_middle(
+    args: &[&Zval],
     state: &BridgeState,
-    depth: usize,
-) -> Result<MiddleValue, String> {
-    if depth > 64 {
-        return Err("PHP bridge value exceeds maximum depth (64)".to_owned());
+) -> Result<Vec<MiddleValue>, String> {
+    let mut conversion = PhpConversion::new(state, true);
+    let result = args
+        .iter()
+        .map(|arg| conversion.convert(arg, 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    conversion.registered.clear();
+    Ok(result)
+}
+
+pub fn data_arguments(args: &ZendHashTable, state: &BridgeState) -> Result<MiddleValue, String> {
+    if !args.has_sequential_keys() {
+        return Err("args must be a list or null".to_owned());
     }
-    if zv.is_null() {
-        return Ok(MiddleValue::Null);
+    let mut conversion = PhpConversion::new(state, false);
+    conversion.budget.node(0)?;
+    conversion.array(args, 0)
+}
+
+struct PhpConversion<'a> {
+    state: &'a BridgeState,
+    budget: ConversionBudget,
+    functions: bool,
+    registered: Vec<u64>,
+}
+impl<'a> PhpConversion<'a> {
+    fn new(state: &'a BridgeState, functions: bool) -> Self {
+        Self {
+            state,
+            budget: if functions {
+                ConversionBudget::default()
+            } else {
+                ConversionBudget::direct()
+            },
+            functions,
+            registered: Vec::new(),
+        }
     }
-    if zv.is_bool() {
-        return Ok(MiddleValue::Bool(zv.bool().unwrap_or(false)));
-    }
-    if zv.is_long() {
-        return Ok(MiddleValue::Int(zv.long().unwrap()));
-    }
-    if zv.is_double() {
-        return Ok(MiddleValue::Float(zv.double().unwrap()));
-    }
-    if zv.is_string() {
-        // PHP strings are byte strings. Preserve valid UTF-8 as a string;
-        // anything else (binary data) crosses as bytes -> JS Uint8Array.
-        let bytes = zv.zend_str().map(|zs| zs.as_bytes()).unwrap_or(&[]);
-        return Ok(match std::str::from_utf8(bytes) {
-            Ok(s) => MiddleValue::Str(s.to_owned()),
-            Err(_) => MiddleValue::Bytes(bytes.to_owned()),
-        });
-    }
-    if zv.is_array() {
-        let ht = zv.array().unwrap();
-        return hashtable_to_middle(ht, state, depth);
-    }
-    // A returned Js\Callback maps back to its original JS function.
-    if zv.is_object() {
+    fn convert(&mut self, zv: &Zval, depth: usize) -> Result<MiddleValue, String> {
+        self.budget.node(depth)?;
+        if zv.is_null() {
+            return Ok(MiddleValue::Null);
+        }
+        if zv.is_bool() {
+            return Ok(MiddleValue::Bool(zv.bool().unwrap_or(false)));
+        }
+        if zv.is_long() {
+            return Ok(MiddleValue::Int(zv.long().unwrap()));
+        }
+        if zv.is_double() {
+            return Ok(MiddleValue::Float(zv.double().unwrap()));
+        }
+        if zv.is_string() {
+            let bytes = zv.zend_str().map(|zs| zs.as_bytes()).unwrap_or(&[]);
+            self.budget.charge(bytes.len())?;
+            return Ok(match std::str::from_utf8(bytes) {
+                Ok(s) => MiddleValue::Str(s.to_owned()),
+                Err(_) => MiddleValue::Bytes(bytes.to_owned()),
+            });
+        }
+        if let Some(array) = zv.array() {
+            return self.array(array, depth);
+        }
+        if !self.functions {
+            return Err("direct dispatch arguments must contain data only".to_owned());
+        }
         if let Some(cb) = zv.extract::<&ZendClassObject<JsCallback>>() {
+            let owner = self.state.engine().ok_or("engine no longer available")?;
+            if !std::rc::Rc::ptr_eq(&owner, &cb.engine) {
+                return Err("JS callback belongs to a different QuickJS instance".to_owned());
+            }
             return Ok(MiddleValue::JsFn(cb.id));
         }
+        if zv.is_callable() {
+            let id = self.state.register_php_fn(zv);
+            self.registered.push(id);
+            return Ok(MiddleValue::PhpFn(id));
+        }
+        Err("unsupported PHP value type for marshaling".to_owned())
     }
-    // Any other callable (closure, [obj, 'method'] is caught above as array) is
-    // registered host-side and handed to JS as a callable wrapper.
-    if zv.is_callable() {
-        return Ok(MiddleValue::PhpFn(state.register_php_fn(zv)));
+    fn array(&mut self, ht: &ZendHashTable, depth: usize) -> Result<MiddleValue, String> {
+        if self
+            .budget
+            .remaining()
+            .is_some_and(|remaining| ht.len() > remaining / VALUE_OVERHEAD)
+        {
+            return Err("bridge array exceeds size limit".to_owned());
+        }
+        if ht.has_sequential_keys() {
+            let mut out = Vec::with_capacity(ht.len());
+            for (_, value) in ht.iter() {
+                out.push(self.convert(value, depth + 1)?);
+            }
+            Ok(MiddleValue::Array(out))
+        } else {
+            let mut out = Vec::with_capacity(ht.len());
+            for (key, value) in ht.iter() {
+                let key = match key {
+                    ArrayKey::Long(i) => i.to_string(),
+                    ArrayKey::String(s) => s,
+                    ArrayKey::Str(s) => s.to_owned(),
+                    ArrayKey::ZendString(s) => s.try_into().unwrap_or_default(),
+                };
+                self.budget.charge(key.len())?;
+                out.push((key, self.convert(value, depth + 1)?));
+            }
+            Ok(MiddleValue::Map(out))
+        }
     }
-    Err("unsupported PHP value type for marshaling".to_owned())
 }
-
-/// A PHP array becomes an [`MiddleValue::Array`] when its keys are the
-/// sequential `0..n`, otherwise an insertion-ordered [`MiddleValue::Map`].
-fn hashtable_to_middle(
-    ht: &ZendHashTable,
-    state: &BridgeState,
-    depth: usize,
-) -> Result<MiddleValue, String> {
-    if ht.has_sequential_keys() {
-        let mut out = Vec::with_capacity(ht.len());
-        for (_, v) in ht.iter() {
-            out.push(zval_to_middle_depth(v, state, depth + 1)?);
-        }
-        Ok(MiddleValue::Array(out))
-    } else {
-        let mut out = Vec::with_capacity(ht.len());
-        for (k, v) in ht.iter() {
-            let key = match k {
-                ArrayKey::Long(i) => i.to_string(),
-                ArrayKey::String(s) => s,
-                ArrayKey::Str(s) => s.to_owned(),
-                ArrayKey::ZendString(s) => s.try_into().unwrap_or_default(),
-            };
-            out.push((key, zval_to_middle_depth(v, state, depth + 1)?));
-        }
-        Ok(MiddleValue::Map(out))
+impl Drop for PhpConversion<'_> {
+    fn drop(&mut self) {
+        self.state.release_php_fns(&self.registered);
     }
 }
 

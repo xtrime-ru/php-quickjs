@@ -41,9 +41,7 @@ pub struct BridgeState {
     /// JS-callback ids whose PHP wrapper was dropped, awaiting release from the
     /// JS registry (deferred to the next eval boundary; see `JsCallback::drop`).
     pending_fn_deletions: RefCell<Vec<u64>>,
-    pub messages: RefCell<Vec<MiddleValue>>,
-    pub collecting: Cell<bool>,
-    pub message_bytes: Cell<usize>,
+    batch: RefCell<Option<MessageBatch>>,
 }
 
 impl BridgeState {
@@ -98,6 +96,28 @@ impl BridgeState {
             .borrow_mut()
             .insert(id, callable.shallow_clone());
         id
+    }
+
+    pub(crate) fn release_php_fns(&self, ids: &[u64]) {
+        // Drop captured PHP values after releasing the RefCell borrow: PHP
+        // destructors may call back into the extension.
+        let removed: Vec<_> = {
+            let mut functions = self.php_funcs.borrow_mut();
+            ids.iter().filter_map(|id| functions.remove(id)).collect()
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn begin_batch(&self) -> BatchGuard<'_> {
+        *self.batch.borrow_mut() = Some(MessageBatch::default());
+        BatchGuard { state: self }
+    }
+
+    pub(crate) fn take_messages(&self) -> Vec<MiddleValue> {
+        self.batch
+            .borrow_mut()
+            .take()
+            .map_or_else(Vec::new, |batch| batch.messages)
     }
 
     pub fn get_php_fn(&self, id: u64) -> Option<Zval> {
@@ -195,28 +215,22 @@ pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<
         Function::new(
             ctx.clone(),
             move |ctx: Ctx<'js>, kind: String, payload: Value<'js>| -> rquickjs::Result<()> {
-                if !queue_state.collecting.get() {
+                if queue_state.batch.borrow().is_none() {
                     return Err(Exception::throw_type(
                         &ctx,
                         "__quickjsEmit requires dispatch",
                     ));
                 }
-                let value = js_to_data(&ctx, payload, &queue_state)?;
-                let size = message_size(&value)
-                    .saturating_add(kind.len())
-                    .saturating_add(128);
-                let total = queue_state.message_bytes.get().saturating_add(size);
-                if total > 33_554_432 || queue_state.messages.borrow().len() >= 4096 {
-                    return Err(Exception::throw_type(
-                        &ctx,
-                        "dispatch message queue limit exceeded",
-                    ));
-                }
-                queue_state.message_bytes.set(total);
-                queue_state
-                    .messages
-                    .borrow_mut()
-                    .push(MiddleValue::Array(vec![MiddleValue::Str(kind), value]));
+                // Conversion may invoke getters, including nested emit calls;
+                // never hold the queue borrow while JavaScript can execute.
+                let (value, bytes) = js_to_data(&ctx, payload)?;
+                let mut active = queue_state.batch.borrow_mut();
+                let batch = active
+                    .as_mut()
+                    .ok_or_else(|| Exception::throw_type(&ctx, "inactive dispatch"))?;
+                batch
+                    .push(kind, value, bytes)
+                    .map_err(|e| Exception::throw_type(&ctx, e))?;
                 Ok(())
             },
         )?,
@@ -335,13 +349,37 @@ mod tests {
     }
 }
 
-// Conservative allocation accounting includes each value/container slot.
-fn message_size(value: &MiddleValue) -> usize {
-    64 + match value {
-        MiddleValue::Str(s) => s.len(),
-        MiddleValue::Bytes(b) => b.len(),
-        MiddleValue::Array(a) => a.iter().map(message_size).sum(),
-        MiddleValue::Map(m) => m.iter().map(|(k, v)| k.len() + message_size(v)).sum(),
-        _ => 0,
+const MAX_BATCH_MESSAGES: usize = 4096;
+const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+const MESSAGE_OVERHEAD: usize = 128;
+
+#[derive(Default)]
+struct MessageBatch {
+    messages: Vec<MiddleValue>,
+    bytes: usize,
+}
+impl MessageBatch {
+    fn push(&mut self, kind: String, value: MiddleValue, bytes: usize) -> Result<(), &'static str> {
+        let total = self
+            .bytes
+            .saturating_add(bytes)
+            .saturating_add(kind.len())
+            .saturating_add(MESSAGE_OVERHEAD);
+        if total > MAX_BATCH_BYTES || self.messages.len() >= MAX_BATCH_MESSAGES {
+            return Err("dispatch message queue limit exceeded");
+        }
+        self.bytes = total;
+        self.messages
+            .push(MiddleValue::Array(vec![MiddleValue::Str(kind), value]));
+        Ok(())
+    }
+}
+
+pub(crate) struct BatchGuard<'a> {
+    state: &'a BridgeState,
+}
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        self.state.batch.borrow_mut().take();
     }
 }

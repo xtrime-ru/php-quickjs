@@ -49,4 +49,11 @@ eq(3, $js->eval('1 + 2'), 'engine recovers after rejected eval');
 $loop = $js->eval('() => { while (true) {} }');
 throws(fn() => $loop(), QuickJSTimeoutException::class, 'saved callbacks obey the execution timeout');
 eq(3, $js->eval('1 + 2'), 'engine recovers after callback timeout');
+
+$short = new QuickJS(timeoutMs: 20);
+$short->register('slow', function () { usleep(50000); return 42; });
+$slow = $short->eval('() => php.slow()');
+throws(fn() => $slow(), QuickJSTimeoutException::class, 'blocking callback timeout detected on return');
+eq(3, $short->eval('1+2'), 'engine recovers after blocking callback timeout');
+
 done();

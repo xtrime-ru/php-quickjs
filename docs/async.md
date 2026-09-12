@@ -45,7 +45,7 @@ by a different QuickJS instance. Calling `eval()` or `executePendingJobs()` reen
 the active instance is rejected; use a saved JS callback for synchronous reentry.
 
 The execution deadline interrupts JavaScript, not blocking PHP/C code in a host
-callback. Keep host callbacks short. The extension remains single-threaded/NTS;
+callback. An overrun throws when PHP returns to the extension. Keep host callbacks short. The extension remains single-threaded/NTS;
 Fiber support does not add ZTS or parallel-thread support.
 
 ## Batched direct dispatch
@@ -69,16 +69,22 @@ a MessagePack encode/decode round trip; valid UTF-8 strings stay strings and
 binary PHP strings become `Uint8Array` and round-trip byte-for-byte.
 
 Message payloads accept null, booleans, numbers, strings, `Uint8Array`, arrays and
-objects containing data; functions are rejected. JS conversion allows at most
-64 nesting levels and 16 MiB of accounted payload storage, including container
-overhead. A batch queue allows 4096 messages and 32 MiB of accounted storage.
+objects containing data; functions are rejected. PHP arguments likewise accept only
+data, not Closure objects or saved JS callbacks; use call() for callable arguments.
+Each output payload and the complete PHP argument list are limited to 64 nesting
+levels and 16 MiB of accounted storage, including container overhead. Generic
+eval(), call() and roundtrip() retain the depth limit but have no transport byte cap. A batch queue allows 4096 messages and 32 MiB of accounted storage.
 These host-side caps are separate from QuickJS's `memoryLimit`. Cycles, oversized
 values and queue overflow throw JS errors. PHP input nesting is also limited to
 64 levels. Errors escaping a batch discard its partial messages; remaining
 Promise jobs stay queued, so applications must decide whether to resume or
 abandon that operation. Callback return values are ignored.
 
-Timeouts are checked between jobs as well as by QuickJS's interrupt hook. A
+Timeouts are checked before and after each job and at native-call return, as well as by QuickJS's interrupt hook. A
 blocking PHP callback cannot be interrupted, but no further job starts after
 its batch deadline has elapsed. Dropped callback registry entries are reclaimed
 at the next outer engine entry, including callback-only and job-only loops.
+
+Failed generic value conversion rolls back callback registrations. Passing a saved
+JS callback as an argument requires the same owning QuickJS instance; invoking a
+foreign callback directly from PHP remains supported.

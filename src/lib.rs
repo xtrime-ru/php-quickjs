@@ -98,7 +98,7 @@ impl QuickJS {
         })?;
 
         let state = self.engine.state.clone();
-        let outcome = self.engine.eval_in(|ctx| {
+        self.engine.eval_in(|ctx| {
             let map = module.map_json.clone();
             let eval_err = |e| self.classify_js_error(ctx, e, map.as_deref(), &module.module_id);
             bridge::install(ctx, state.clone()).map_err(&eval_err)?;
@@ -110,26 +110,18 @@ impl QuickJS {
                 .map_err(&eval_err)?;
             let middle = js_to_middle(ctx, value, &state).map_err(&eval_err)?;
             middle_to_zval(&middle, &state).map_err(PhpException::default)
-        });
-        match outcome {
-            Ok(r) => r,
-            Err(e) => Err(to_php_err(e)),
-        }
+        })
     }
 
     /// Whether Promise jobs are ready. This does not include pending host I/O.
     pub fn hasPendingJobs(&self) -> PhpResult<bool> {
         self.require_shared_jobs()?;
-        self.engine
-            .eval_in(|ctx| {
-                // SAFETY: the context and its runtime are locked by eval_in.
-                unsafe {
-                    rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(
-                        ctx.as_raw().as_ptr(),
-                    ))
-                }
+        self.engine.eval_in(|ctx| {
+            // SAFETY: the context and its runtime are locked by eval_in.
+            Ok(unsafe {
+                rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()))
             })
-            .map_err(to_php_err)
+        })
     }
 
     /// Execute at most maxJobs ready jobs; never waits for host I/O. Jobs are
@@ -149,7 +141,6 @@ impl QuickJS {
         }
         self.engine
             .eval_in(|ctx| self.engine.run_jobs(ctx, maxJobs))
-            .map_err(to_php_err)?
     }
 
     /// Return the registration manifest as an array of `['name'=>..., 'types'=>...]`.
@@ -210,18 +201,14 @@ impl QuickJS {
     pub fn roundtrip(&self, value: &Zval) -> PhpResult<Zval> {
         let state = self.engine.state.clone();
         let middle = zval_to_middle(value, &state).map_err(PhpException::default)?;
-        let outcome = self.engine.eval_in(|ctx| {
+        self.engine.eval_in(|ctx| {
             // Runtime support must exist for any function reconstruction.
             bridge::install(ctx, state.clone())
                 .map_err(|e| PhpException::default(error::js_error_message(ctx, e)))?;
             let js = middle_to_js(ctx, &middle, &state).map_err(to_php_err)?;
             let back = js_to_middle(ctx, js, &state).map_err(to_php_err)?;
             middle_to_zval(&back, &state).map_err(PhpException::default)
-        });
-        match outcome {
-            Ok(r) => r,
-            Err(e) => Err(to_php_err(e)),
-        }
+        })
     }
 }
 

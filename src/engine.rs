@@ -3,6 +3,7 @@
 use crate::bridge::BridgeState;
 use crate::sandbox;
 use crate::transpile::TranspileCache;
+use ext_php_rs::prelude::*;
 use rquickjs::{Context, Ctx, Runtime};
 use std::cell::Cell;
 use std::ptr::NonNull;
@@ -33,49 +34,33 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn run_jobs(&self, ctx: &Ctx<'_>, max_jobs: i64) -> ext_php_rs::prelude::PhpResult<i64> {
+    fn check_deadline(&self, ctx: &Ctx<'_>) -> PhpResult<()> {
+        if self.timed_out() || self.deadline.get().is_some_and(|d| Instant::now() >= d) {
+            self.timed_out.set(true);
+            drop(ctx.catch());
+            return Err(PhpException::from_class::<
+                crate::exceptions::QuickJSTimeoutException,
+            >("JavaScript execution timed out".to_owned()));
+        }
+        Ok(())
+    }
+
+    pub fn run_jobs(&self, ctx: &Ctx<'_>, max_jobs: i64) -> PhpResult<i64> {
         let mut count = 0;
         while count < max_jobs {
+            self.check_deadline(ctx)?;
             let mut job_ctx = std::ptr::null_mut();
-            // SAFETY: eval_in owns the runtime lock. QuickJS returns a
-            // borrowed context pointer on failure, valid in this runtime.
+            // SAFETY: eval_in holds the runtime lock. The returned context is
+            // borrowed from that runtime; Ctx::from_raw acquires its own ref.
             let result = unsafe {
                 rquickjs::qjs::JS_ExecutePendingJob(
                     rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()),
                     &mut job_ctx,
                 )
             };
-            if self.timed_out()
-                || self
-                    .deadline
-                    .get()
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                self.timed_out.set(true);
-                // Check wall time even if short jobs never reach QuickJS's
-                // interrupt poll, including jobs that call slow PHP callbacks.
-                // Promise reactions can turn an interrupt into a rejection;
-                // still surface the execution budget to the host.
-                if result < 0 {
-                    let c = unsafe {
-                        rquickjs::Ctx::from_raw(
-                            std::ptr::NonNull::new(job_ctx).expect("job error context"),
-                        )
-                    };
-                    drop(c.catch());
-                }
-                return Err(ext_php_rs::exception::PhpException::from_class::<
-                    crate::exceptions::QuickJSTimeoutException,
-                >(
-                    "JavaScript job execution timed out".to_owned()
-                ));
-            }
+            self.check_deadline(ctx)?;
             if result < 0 {
-                let c = unsafe {
-                    rquickjs::Ctx::from_raw(
-                        std::ptr::NonNull::new(job_ctx).expect("job error context"),
-                    )
-                };
+                let c = unsafe { Ctx::from_raw(NonNull::new(job_ctx).expect("job error context")) };
                 return Err(crate::error::js_error_to_php(
                     &c,
                     rquickjs::Error::Exception,
@@ -153,12 +138,15 @@ impl Engine {
 
     /// Run on the current PHP stack. Reentrant callbacks reuse this engine's
     /// context; a callback belonging to a different engine gets its own context.
-    pub fn eval_in<R>(&self, f: impl FnOnce(&Ctx<'_>) -> R) -> rquickjs::Result<R> {
+    pub fn eval_in<R>(&self, f: impl FnOnce(&Ctx<'_>) -> PhpResult<R>) -> PhpResult<R> {
         if let Some(ptr) = self.active_ctx.get() {
             // SAFETY: the outer Context::with owns this context and its lock.
             // Fiber switching is blocked until that call returns.
             let ctx = unsafe { Ctx::from_raw(ptr) };
-            return Ok(f(&ctx));
+            self.check_deadline(&ctx)?;
+            let result = f(&ctx);
+            self.check_deadline(&ctx)?;
+            return result;
         }
         let run = |ctx: &Context| {
             ctx.with(|c| {
@@ -172,14 +160,19 @@ impl Engine {
                 self.active_ctx.set(Some(c.as_raw()));
                 self.arm_deadline();
                 let _guard = ExecutionGuard { engine: self };
-                crate::bridge::flush_pending_deletions(&c, &self.state)?;
-                Ok(f(&c))
+                crate::bridge::flush_pending_deletions(&c, &self.state)
+                    .map_err(|e| self.callback_error(&c, e))?;
+                self.check_deadline(&c)?;
+                let result = f(&c);
+                self.check_deadline(&c)?;
+                result
             })
         };
         match &self.shared_ctx {
             Some(ctx) => run(ctx),
             None => {
-                let ctx = Context::full(&self.rt)?;
+                let ctx =
+                    Context::full(&self.rt).map_err(|e| PhpException::default(e.to_string()))?;
                 run(&ctx)
             }
         }

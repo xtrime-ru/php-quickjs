@@ -33,4 +33,22 @@ eq([], $js->roundtrip([]), 'empty array');
 $bytes = "\x00\x01\x02\xff";
 eq($bytes, $js->eval('new Uint8Array([0,1,2,255])'), 'Uint8Array -> binary string');
 
+
+$baseline = $js->eval('__jsFnCount()');
+throws(fn() => $js->eval('[() => 42, Symbol("bad")]'), Throwable::class, 'failed conversion rejects unsupported JS value');
+eq($baseline, $js->eval('__jsFnCount()'), 'failed conversion releases registered JS functions');
+eq(16777217, strlen($js->eval('"x".repeat(16777217)')), 'generic eval is not limited by transport byte cap');
+$call = $js->eval('(fn) => fn()');
+$own = $js->eval('() => 99');
+eq(99, $call($own), 'same-engine callbacks remain supported');
+$other = new QuickJS();
+$foreign = $other->eval('() => 42');
+throws(fn() => $call($foreign), Throwable::class, 'foreign callback arguments rejected');
+$captured = new stdClass();
+$weak = WeakReference::create($captured);
+$closure = fn() => $captured;
+try { $call($closure, new stdClass()); } catch (Throwable) {}
+unset($closure, $captured);
+eq(null, $weak->get(), 'failed argument conversion releases PHP closures');
+
 done();
