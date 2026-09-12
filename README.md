@@ -111,6 +111,13 @@ both ways — remapping to TS coordinates on the way out.
 
 → **[docs/architecture.md](docs/architecture.md)** for the full design.
 
+## Asynchronous execution
+
+Use `executePendingJobs()` to advance Promise continuations in bounded batches and
+`hasPendingJobs()` to check for ready work. The host owns timers and I/O.
+Instances may be used sequentially from PHP Fibers, but host callbacks must
+return before switching Fibers. See [Promise jobs and Fibers](docs/async.md).
+
 ## Scope
 
 This is an *embedder*, not a standalone defence against hostile code. The capability

@@ -13,7 +13,7 @@ class QuickJS
 {
     /**
      * @param int|null $memoryLimit Max heap bytes (0/null = unbounded).
-     * @param int|null $timeoutMs   Per-eval/callback wall-clock budget in ms (0/null = unbounded).
+     * @param int|null $timeoutMs   Per-eval/callback/job-batch wall-clock budget in ms (0/null = unbounded).
      * @param int|null $maxStack    Max native stack bytes (0/null = engine default).
      * @param bool     $isolated    Run each eval() in its own fresh global realm.
      */
@@ -34,6 +34,12 @@ class QuickJS
 
     /** The registration manifest: a list of `['name' => string, 'types' => ?string]`. */
     public function manifest(): array {}
+
+    /** Whether Promise jobs are ready (shared mode only). Does not include host I/O. */
+    public function hasPendingJobs(): bool {}
+
+    /** Execute at most maxJobs ready jobs without waiting for I/O; returns the count. */
+    public function executePendingJobs(int $maxJobs = 100): int {}
 
     /** Generate a TypeScript `.d.ts` declaration for the `php` global. */
     public function dts(): string {}

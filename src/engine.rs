@@ -33,6 +33,62 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn run_jobs(&self, ctx: &Ctx<'_>, max_jobs: i64) -> ext_php_rs::prelude::PhpResult<i64> {
+        let mut count = 0;
+        while count < max_jobs {
+            let mut job_ctx = std::ptr::null_mut();
+            // SAFETY: eval_in owns the runtime lock. QuickJS returns a
+            // borrowed context pointer on failure, valid in this runtime.
+            let result = unsafe {
+                rquickjs::qjs::JS_ExecutePendingJob(
+                    rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()),
+                    &mut job_ctx,
+                )
+            };
+            if self.timed_out()
+                || self
+                    .deadline
+                    .get()
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.timed_out.set(true);
+                // Check wall time even if short jobs never reach QuickJS's
+                // interrupt poll, including jobs that call slow PHP callbacks.
+                // Promise reactions can turn an interrupt into a rejection;
+                // still surface the execution budget to the host.
+                if result < 0 {
+                    let c = unsafe {
+                        rquickjs::Ctx::from_raw(
+                            std::ptr::NonNull::new(job_ctx).expect("job error context"),
+                        )
+                    };
+                    drop(c.catch());
+                }
+                return Err(ext_php_rs::exception::PhpException::from_class::<
+                    crate::exceptions::QuickJSTimeoutException,
+                >(
+                    "JavaScript job execution timed out".to_owned()
+                ));
+            }
+            if result < 0 {
+                let c = unsafe {
+                    rquickjs::Ctx::from_raw(
+                        std::ptr::NonNull::new(job_ctx).expect("job error context"),
+                    )
+                };
+                return Err(crate::error::js_error_to_php(
+                    &c,
+                    rquickjs::Error::Exception,
+                ));
+            }
+            if result == 0 {
+                break;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
     pub fn new(
         memory_limit: usize,
         timeout_ms: u64,

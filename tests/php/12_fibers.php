@@ -6,8 +6,14 @@ $callback = $js->eval('(n) => n * 2');
 $fiber = new Fiber(function () use ($js, $callback) {
     eq(3, $js->eval('1 + 2'), 'main-stack engine runs in a Fiber');
     eq(42, $callback(21), 'main-stack callback runs in a Fiber');
+    $js->eval('globalThis.value = 0; Promise.resolve().then(() => { value = 17; }); void 0;');
+    Fiber::suspend();
+    $js->executePendingJobs();
+    eq(17, $js->eval('value'), 'jobs run after Fiber resumption');
 });
 $fiber->start();
+eq(true, $js->hasPendingJobs(), 'ready jobs visible from main stack');
+$fiber->resume();
 eq(6, $callback(3), 'callback returns to main stack');
 
 $inside = null;

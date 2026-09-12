@@ -126,7 +126,8 @@ errors. A re-entrancy depth cap (200) bounds recursive bridge calls.
 
 At an outer entry, QuickJS's stack limit is refreshed for the current PHP Fiber.
 Zend Fiber switching is blocked while native borrows are live. The same guard
-arms and clears the execution deadline for evals and callbacks.
+arms and clears the execution deadline for evals, callbacks, and job batches.
+See [asynchronous execution](async.md).
 
 ## Capability handles
 

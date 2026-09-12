@@ -43,3 +43,25 @@ both from the same source of truth.
 Diagnostic helper: send a PHP value through the full marshaling pipeline
 (PHP → MiddleValue → JS → MiddleValue → PHP) and return the result. Useful for
 testing value fidelity across the boundary; not needed in normal use.
+
+
+### `hasPendingJobs(): bool`
+
+Whether a Promise continuation is ready to run. An unresolved Promise waiting
+for host I/O is not a ready job. Available in shared mode only.
+
+### `executePendingJobs(int $maxJobs = 100): int`
+
+Execute up to `maxJobs` ready Promise jobs and return the number executed. The
+budget must be positive. Returns immediately when the queue is empty; never
+waits for external I/O. Jobs queued by a running job count towards the same
+budget. The constructor's `timeoutMs` also applies to this call, including an
+individual job that does not return; a timeout raises `QuickJSTimeoutException`.
+
+Only shared mode supports job pumping. Calling `executePendingJobs()` from an active JS
+call is rejected. `eval()` and `Js\Callback` do not drain jobs implicitly.
+Promise rejections retain JavaScript semantics: use `.catch()`/rejection handlers;
+`executePendingJobs()` is not an unhandled-rejection reporting API.
+
+See [asynchronous execution](async.md) for host event loop integration and PHP
+Fiber boundaries.

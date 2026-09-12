@@ -34,7 +34,7 @@ impl QuickJS {
     /// Construct a sandbox. All limits default to unbounded; pass non-zero
     /// values to contain resource abuse:
     /// - `memoryLimit`: max heap bytes (alloc-bomb guard)
-    /// - `timeoutMs`: wall-clock budget per eval or callback
+    /// - `timeoutMs`: wall-clock budget per eval, callback, or job batch
     /// - `maxStack`: max native stack bytes
     /// - `isolated`: when true, each `eval()` runs in a fresh global realm (its
     ///   own world); cross-eval globals and persistent JS callbacks are not
@@ -117,6 +117,41 @@ impl QuickJS {
         }
     }
 
+    /// Whether Promise jobs are ready. This does not include pending host I/O.
+    pub fn hasPendingJobs(&self) -> PhpResult<bool> {
+        self.require_shared_jobs()?;
+        self.engine
+            .eval_in(|ctx| {
+                // SAFETY: the context and its runtime are locked by eval_in.
+                unsafe {
+                    rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(
+                        ctx.as_raw().as_ptr(),
+                    ))
+                }
+            })
+            .map_err(to_php_err)
+    }
+
+    /// Execute at most maxJobs ready jobs; never waits for host I/O. Jobs are
+    /// explicit, so eval/callback execution keeps its synchronous behavior.
+    #[php(defaults(maxJobs = 100))]
+    pub fn executePendingJobs(&self, maxJobs: i64) -> PhpResult<i64> {
+        self.require_shared_jobs()?;
+        if maxJobs <= 0 {
+            return Err(PhpException::default(
+                "maxJobs must be greater than zero".to_owned(),
+            ));
+        }
+        if self.engine.is_active() {
+            return Err(PhpException::default(
+                "Cannot run jobs while JavaScript is executing".to_owned(),
+            ));
+        }
+        self.engine
+            .eval_in(|ctx| self.engine.run_jobs(ctx, maxJobs))
+            .map_err(to_php_err)?
+    }
+
     /// Return the registration manifest as an array of `['name'=>..., 'types'=>...]`.
     pub fn manifest(&self) -> PhpResult<Zval> {
         let state = &self.engine.state;
@@ -191,6 +226,15 @@ impl QuickJS {
 }
 
 impl QuickJS {
+    fn require_shared_jobs(&self) -> PhpResult<()> {
+        if self.engine.shared_ctx().is_none() {
+            return Err(PhpException::default(
+                "Promise jobs require shared mode (isolated: false)".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Map a JS-side failure to the most specific PHP exception class: timeout
     /// (deadline tripped), memory (heap limit), else a generic eval error. For
     /// the eval case the JS stack is remapped to TypeScript coordinates via the
