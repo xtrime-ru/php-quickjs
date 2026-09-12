@@ -65,7 +65,10 @@ namespace Js {
      */
     class Callback
     {
-        /** @return array{messages: list<array{string, mixed}>, jobs: int, pending: bool} */
+        /**
+         * @param list<scalar|array|null>|null $args Data-only positional arguments.
+         * @return array{messages: list<array{string, mixed}>, jobs: int, pending: bool}
+         */
         public function dispatch(?array $args, int $maxJobs = 100): array {}
         public function __invoke(mixed ...$args): mixed {}
         public function call(mixed ...$args): mixed {}
