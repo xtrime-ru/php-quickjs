@@ -1,5 +1,7 @@
 <?php
 
+namespace {
+
 // Stubs for the php-quickjs extension (IDE / static-analysis aid only).
 // These declarations describe the native classes; they are not loaded at
 // runtime. Regenerate with `make stubs` (requires cargo-php).
@@ -11,7 +13,7 @@ class QuickJS
 {
     /**
      * @param int|null $memoryLimit Max heap bytes (0/null = unbounded).
-     * @param int|null $timeoutMs   Per-eval wall-clock budget in ms (0/null = unbounded).
+     * @param int|null $timeoutMs   Per-eval/callback wall-clock budget in ms (0/null = unbounded).
      * @param int|null $maxStack    Max native stack bytes (0/null = engine default).
      * @param bool     $isolated    Run each eval() in its own fresh global realm.
      */
@@ -47,6 +49,8 @@ class QuickJS
 
     /** Round-trip a PHP value through JS and back (testing/diagnostics). */
     public function roundtrip(mixed $value): mixed {}
+}
+
 }
 
 namespace Js {

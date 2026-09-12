@@ -212,6 +212,24 @@ pub fn js_to_middle<'js>(
     value: Value<'js>,
     _state: &BridgeState,
 ) -> rquickjs::Result<MiddleValue> {
+    js_to_middle_bounded(ctx, value, _state, 0, &mut 16_777_216, true)
+}
+
+fn js_to_middle_bounded<'js>(
+    ctx: &Ctx<'js>,
+    value: Value<'js>,
+    _state: &BridgeState,
+    depth: usize,
+    budget: &mut usize,
+    functions: bool,
+) -> rquickjs::Result<MiddleValue> {
+    if depth > 64 || *budget < 64 {
+        return Err(rquickjs::Exception::throw_type(
+            ctx,
+            "bridge value exceeds depth or size limit",
+        ));
+    }
+    *budget -= 64;
     if value.is_null() || value.is_undefined() {
         return Ok(MiddleValue::Null);
     }
@@ -225,9 +243,19 @@ pub fn js_to_middle<'js>(
         return Ok(int_or_float(value.as_float().unwrap()));
     }
     if let Some(s) = value.as_string() {
-        return Ok(MiddleValue::Str(s.to_string()?));
+        let text = s.to_string()?;
+        *budget = budget.checked_sub(text.len()).ok_or_else(|| {
+            rquickjs::Exception::throw_type(ctx, "bridge value exceeds size limit")
+        })?;
+        return Ok(MiddleValue::Str(text));
     }
     if value.is_function() {
+        if !functions {
+            return Err(rquickjs::Exception::throw_type(
+                ctx,
+                "direct messages cannot contain functions",
+            ));
+        }
         // Register the function JS-side; PHP receives an opaque id.
         let register: Function = ctx.globals().get("__registerJsFn")?;
         let id: f64 = register.call((value.clone(),))?;
@@ -237,15 +265,31 @@ pub fn js_to_middle<'js>(
     if value.is_object() {
         if let Ok(ta) = TypedArray::<u8>::from_value(value.clone()) {
             if let Some(bytes) = ta.as_bytes() {
+                *budget = budget.checked_sub(bytes.len()).ok_or_else(|| {
+                    rquickjs::Exception::throw_type(ctx, "bridge value exceeds size limit")
+                })?;
                 return Ok(MiddleValue::Bytes(bytes.to_vec()));
             }
         }
     }
     if value.is_array() {
         let arr = value.into_array().unwrap();
+        if arr.len() > *budget / 64 {
+            return Err(rquickjs::Exception::throw_type(
+                ctx,
+                "bridge array exceeds size limit",
+            ));
+        }
         let mut out = Vec::with_capacity(arr.len());
         for i in 0..arr.len() {
-            out.push(js_to_middle(ctx, arr.get(i)?, _state)?);
+            out.push(js_to_middle_bounded(
+                ctx,
+                arr.get(i)?,
+                _state,
+                depth + 1,
+                budget,
+                functions,
+            )?);
         }
         return Ok(MiddleValue::Array(out));
     }
@@ -254,7 +298,13 @@ pub fn js_to_middle<'js>(
         let mut out = Vec::new();
         for entry in obj.props::<String, Value>() {
             let (k, v) = entry?;
-            out.push((k, js_to_middle(ctx, v, _state)?));
+            *budget = budget.checked_sub(k.len()).ok_or_else(|| {
+                rquickjs::Exception::throw_type(ctx, "bridge value exceeds size limit")
+            })?;
+            out.push((
+                k,
+                js_to_middle_bounded(ctx, v, _state, depth + 1, budget, functions)?,
+            ));
         }
         return Ok(MiddleValue::Map(out));
     }
@@ -318,6 +368,17 @@ pub fn middle_to_js<'js>(
 /// a [`MiddleValue::JsFn`] ref; any other PHP callable is registered host-side
 /// as a [`MiddleValue::PhpFn`].
 pub fn zval_to_middle(zv: &Zval, state: &BridgeState) -> Result<MiddleValue, String> {
+    zval_to_middle_depth(zv, state, 0)
+}
+
+fn zval_to_middle_depth(
+    zv: &Zval,
+    state: &BridgeState,
+    depth: usize,
+) -> Result<MiddleValue, String> {
+    if depth > 64 {
+        return Err("PHP bridge value exceeds maximum depth (64)".to_owned());
+    }
     if zv.is_null() {
         return Ok(MiddleValue::Null);
     }
@@ -341,7 +402,7 @@ pub fn zval_to_middle(zv: &Zval, state: &BridgeState) -> Result<MiddleValue, Str
     }
     if zv.is_array() {
         let ht = zv.array().unwrap();
-        return hashtable_to_middle(ht, state);
+        return hashtable_to_middle(ht, state, depth);
     }
     // A returned Js\Callback maps back to its original JS function.
     if zv.is_object() {
@@ -359,11 +420,15 @@ pub fn zval_to_middle(zv: &Zval, state: &BridgeState) -> Result<MiddleValue, Str
 
 /// A PHP array becomes an [`MiddleValue::Array`] when its keys are the
 /// sequential `0..n`, otherwise an insertion-ordered [`MiddleValue::Map`].
-fn hashtable_to_middle(ht: &ZendHashTable, state: &BridgeState) -> Result<MiddleValue, String> {
+fn hashtable_to_middle(
+    ht: &ZendHashTable,
+    state: &BridgeState,
+    depth: usize,
+) -> Result<MiddleValue, String> {
     if ht.has_sequential_keys() {
         let mut out = Vec::with_capacity(ht.len());
         for (_, v) in ht.iter() {
-            out.push(zval_to_middle(v, state)?);
+            out.push(zval_to_middle_depth(v, state, depth + 1)?);
         }
         Ok(MiddleValue::Array(out))
     } else {
@@ -375,7 +440,7 @@ fn hashtable_to_middle(ht: &ZendHashTable, state: &BridgeState) -> Result<Middle
                 ArrayKey::Str(s) => s.to_owned(),
                 ArrayKey::ZendString(s) => s.try_into().unwrap_or_default(),
             };
-            out.push((key, zval_to_middle(v, state)?));
+            out.push((key, zval_to_middle_depth(v, state, depth + 1)?));
         }
         Ok(MiddleValue::Map(out))
     }

@@ -34,7 +34,7 @@ impl QuickJS {
     /// Construct a sandbox. All limits default to unbounded; pass non-zero
     /// values to contain resource abuse:
     /// - `memoryLimit`: max heap bytes (alloc-bomb guard)
-    /// - `timeoutMs`: wall-clock budget per `eval` (infinite-loop guard)
+    /// - `timeoutMs`: wall-clock budget per eval or callback
     /// - `maxStack`: max native stack bytes
     /// - `isolated`: when true, each `eval()` runs in a fresh global realm (its
     ///   own world); cross-eval globals and persistent JS callbacks are not
@@ -74,6 +74,11 @@ impl QuickJS {
     /// Evaluate JS source and marshal the result back to a PHP value. The
     /// `php.*` facade is installed fresh from the current manifest first.
     pub fn eval(&self, code: String) -> PhpResult<Zval> {
+        if self.engine.is_active() {
+            return Err(PhpException::default(
+                "Cannot eval while JavaScript is executing; use a JS callback".to_owned(),
+            ));
+        }
         // TypeScript fast path: transpile to JS (types erased, esnext) before
         // QuickJS ever sees the source. Transpile/syntax errors surface here,
         // located at their original TS line/column.
@@ -93,7 +98,6 @@ impl QuickJS {
         })?;
 
         let state = self.engine.state.clone();
-        self.engine.arm_deadline();
         let outcome = self.engine.eval_in(|ctx| {
             let map = module.map_json.clone();
             let eval_err = |e| self.classify_js_error(ctx, e, map.as_deref(), &module.module_id);
@@ -107,7 +111,6 @@ impl QuickJS {
             let middle = js_to_middle(ctx, value, &state).map_err(&eval_err)?;
             middle_to_zval(&middle, &state).map_err(PhpException::default)
         });
-        self.engine.disarm_deadline();
         match outcome {
             Ok(r) => r,
             Err(e) => Err(to_php_err(e)),

@@ -5,7 +5,7 @@
 //! invoked from PHP it re-enters JS — reusing the live context if a host call
 //! is already in flight, else acquiring the runtime lock afresh.
 
-use crate::engine::{current_ctx_ptr, Engine};
+use crate::engine::Engine;
 use crate::marshal::{middle_to_zval, zval_to_middle, MiddleValue};
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::Zval;
@@ -62,7 +62,7 @@ impl JsCallback {
             // original PHP class) or becomes a QuickJSEvalException.
             let ret: Value = invoke
                 .call((id as f64, arg_bytes))
-                .map_err(|e| crate::error::js_error_to_php(ctx, e))?;
+                .map_err(|e| engine.callback_error(ctx, e))?;
             let ta = TypedArray::<u8>::from_value(ret).map_err(|e| {
                 PhpException::default(format!("JS callback did not return bytes: {e}"))
             })?;
@@ -74,22 +74,14 @@ impl JsCallback {
             middle_to_zval(&mv, &engine.state).map_err(PhpException::default)
         };
 
-        // Reuse the live context if we are nested inside a host call; otherwise
-        // acquire the runtime lock on the persistent realm. Reusing avoids a
-        // deadlock from re-locking.
-        match current_ctx_ptr() {
-            Some(ptr) => {
-                let ctx = unsafe { Ctx::from_raw(ptr) };
-                run(&ctx)
-            }
-            None => match self.engine.shared_ctx() {
-                Some(ctx) => ctx.with(|c| run(&c)),
-                // Isolated mode: the realm that owned this callback is gone.
-                None => Err(PhpException::default(
-                    "JS callback invoked outside its eval (isolated QuickJS instance)".to_owned(),
-                )),
-            },
+        if !self.engine.is_active() && self.engine.shared_ctx().is_none() {
+            return Err(PhpException::default(
+                "JS callback invoked outside its eval (isolated QuickJS instance)".to_owned(),
+            ));
         }
+        self.engine
+            .eval_in(run)
+            .map_err(|e| PhpException::default(e.to_string()))?
     }
 }
 

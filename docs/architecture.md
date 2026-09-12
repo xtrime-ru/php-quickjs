@@ -118,15 +118,15 @@ encoding (outgoing), `unwrap()` replaces refs with callables after decoding
 `Js\Callback::__invoke` (`callback.rs`) re-enters the realm and calls
 `globalThis.__invokeJs(id, argsBytes)`, which looks up `jsFns[id]` and runs it.
 
-The subtlety is **re-entrancy**. A JS callback is often invoked *synchronously
-while a host call is already running* (e.g. `php.mapEach(xs, fn)` — PHP calls
-`fn` immediately). At that point the runtime is already locked inside a
-`Context::with`; calling `with` again would deadlock. So while any host call (or
-eval) is active, the live `Ctx` pointer is published on a thread-local
-**current-context stack** (`engine.rs`), and `Js\Callback` reuses it instead of
-re-locking. Only when invoked *between* evals (no realm active) does it acquire
-the lock fresh on the persistent realm. A re-entrancy **depth cap** (200) bounds
-runaway PHP→JS→PHP→… recursion.
+The subtlety is **re-entrancy**. Each engine records its own active context
+while inside `Context::with`. A nested callback reuses that context instead of
+acquiring the runtime lock again. A callback owned by another engine enters its
+own context. The active pointer is cleared by a scope guard on return, including
+errors. A re-entrancy depth cap (200) bounds recursive bridge calls.
+
+At an outer entry, QuickJS's stack limit is refreshed for the current PHP Fiber.
+Zend Fiber switching is blocked while native borrows are live. The same guard
+arms and clears the execution deadline for evals and callbacks.
 
 ## Capability handles
 

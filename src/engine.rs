@@ -23,11 +23,12 @@ pub struct Engine {
     /// realm is created per eval and discarded afterwards).
     shared_ctx: Option<Context>,
     depth: Cell<usize>,
-    /// Per-eval wall-clock deadline; `None` when no eval is in flight.
+    active_ctx: Cell<Option<NonNull<rquickjs::qjs::JSContext>>>,
+    /// Per-entry wall-clock deadline; `None` when no eval is in flight.
     deadline: Rc<Cell<Option<Instant>>>,
     /// Set by the interrupt handler when it aborts on the deadline.
     timed_out: Rc<Cell<bool>>,
-    /// Per-eval timeout; `None` disables the wall-clock guard.
+    /// Per-entry timeout; `None` disables the wall-clock guard.
     timeout: Option<Duration>,
 }
 
@@ -58,6 +59,7 @@ impl Engine {
             transpile: TranspileCache::new(256),
             shared_ctx,
             depth: Cell::new(0),
+            active_ctx: Cell::new(None),
             deadline,
             timed_out,
             timeout: (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms)),
@@ -89,24 +91,57 @@ impl Engine {
         self.shared_ctx.as_ref()
     }
 
-    /// Run `f` inside an eval realm: the persistent one in shared mode, or a
-    /// fresh, single-use realm in isolated mode. The realm's `Ctx` is published
-    /// on the current-context stack for the duration so PHP-side callbacks
-    /// (and the GC `Drop` cleanup) re-use it instead of re-locking the runtime.
+    pub fn is_active(&self) -> bool {
+        self.active_ctx.get().is_some()
+    }
+
+    /// Run on the current PHP stack. Reentrant callbacks reuse this engine's
+    /// context; a callback belonging to a different engine gets its own context.
     pub fn eval_in<R>(&self, f: impl FnOnce(&Ctx<'_>) -> R) -> rquickjs::Result<R> {
-        fn run<R>(ctx: &Context, f: impl FnOnce(&Ctx<'_>) -> R) -> R {
-            ctx.with(|c| {
-                let _guard = push_ctx(&c);
-                f(&c)
-            })
+        if let Some(ptr) = self.active_ctx.get() {
+            // SAFETY: the outer Context::with owns this context and its lock.
+            // Fiber switching is blocked until that call returns.
+            let ctx = unsafe { Ctx::from_raw(ptr) };
+            return Ok(f(&ctx));
         }
+        let run = |ctx: &Context| {
+            ctx.with(|c| {
+                // SAFETY: c belongs to this locked runtime. PHP Fibers can enter
+                // on a different native stack, so refresh QuickJS's stack limit
+                // at the outer boundary only (never during JS recursion).
+                unsafe {
+                    rquickjs::qjs::JS_UpdateStackTop(ctx.get_runtime_ptr());
+                    zend_fiber_switch_block();
+                }
+                self.active_ctx.set(Some(c.as_raw()));
+                self.arm_deadline();
+                let _guard = ExecutionGuard { engine: self };
+                crate::bridge::flush_pending_deletions(&c, &self.state)?;
+                Ok(f(&c))
+            })
+        };
         match &self.shared_ctx {
-            Some(ctx) => Ok(run(ctx, f)),
+            Some(ctx) => run(ctx),
             None => {
                 let ctx = Context::full(&self.rt)?;
-                Ok(run(&ctx, f))
+                run(&ctx)
             }
         }
+    }
+
+    pub fn callback_error(
+        &self,
+        ctx: &Ctx<'_>,
+        err: rquickjs::Error,
+    ) -> ext_php_rs::exception::PhpException {
+        if self.timed_out() {
+            // Consume the interrupted JS exception before the next entry.
+            drop(ctx.catch());
+            return ext_php_rs::exception::PhpException::from_class::<
+                crate::exceptions::QuickJSTimeoutException,
+            >("JavaScript callback execution timed out".to_owned());
+        }
+        crate::error::js_error_to_php(ctx, err)
     }
 
     /// Enter one level of cross-boundary nesting; errors if the cap is hit.
@@ -133,40 +168,22 @@ impl Drop for DepthGuard<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// current-context stack
-//
-// While a host call runs, the live `Ctx` is valid but its `'js` lifetime
-// cannot be named in PHP-facing code. We stash the raw pointer so a PHP-held JS
-// callback can be invoked *synchronously* during a host call by reusing the
-// already-locked context instead of re-locking the runtime (which would
-// deadlock). Single-threaded (PHP NTS), so a thread-local stack is sufficient.
-// ---------------------------------------------------------------------------
-
-thread_local! {
-    static CTX_STACK: std::cell::RefCell<Vec<NonNull<rquickjs::qjs::JSContext>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+// These Zend APIs maintain a nesting counter. Blocking switches prevents PHP
+// from suspending while Rust borrows and the QuickJS runtime lock are live.
+unsafe extern "C" {
+    fn zend_fiber_switch_block();
+    fn zend_fiber_switch_unblock();
 }
 
-/// Publish the current context on the stack until the returned guard drops.
-#[must_use]
-pub fn push_ctx(ctx: &Ctx<'_>) -> CtxGuard {
-    CTX_STACK.with(|s| s.borrow_mut().push(ctx.as_raw()));
-    CtxGuard
+struct ExecutionGuard<'a> {
+    engine: &'a Engine,
 }
 
-/// RAII guard that pops the current context when dropped (even on unwind).
-pub struct CtxGuard;
-
-impl Drop for CtxGuard {
+impl Drop for ExecutionGuard<'_> {
     fn drop(&mut self) {
-        CTX_STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
+        self.engine.active_ctx.set(None);
+        self.engine.disarm_deadline();
+        // SAFETY: paired with the block in eval_in, including error unwinding.
+        unsafe { zend_fiber_switch_unblock() };
     }
-}
-
-/// The innermost active context, if a host call is currently on the stack.
-pub fn current_ctx_ptr() -> Option<NonNull<rquickjs::qjs::JSContext>> {
-    CTX_STACK.with(|s| s.borrow().last().copied())
 }

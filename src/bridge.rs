@@ -7,7 +7,7 @@
 //! callable, and returns the msgpack-encoded result. Adding a capability never
 //! changes this ABI.
 
-use crate::engine::{push_ctx, Engine};
+use crate::engine::Engine;
 use crate::error::{throw_host_error, HostError};
 use crate::handles::HandleTable;
 use crate::manifest::ManifestEntry;
@@ -197,10 +197,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<
                 .as_bytes()
                 .ok_or_else(|| Exception::throw_type(&ctx, "__host args must be a Uint8Array"))?;
             let args = decode_args(bytes).map_err(|e| Exception::throw_type(&ctx, &e))?;
-            let result = {
-                let _guard = push_ctx(&ctx);
-                host_call(&host_state, &name, args)
-            };
+            let result = host_call(&host_state, &name, args);
             match result {
                 Ok(r) => encode_result(&ctx, r),
                 Err(err) => Err(throw_host_error(&ctx, &err)),
@@ -221,10 +218,7 @@ pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<
                 Exception::throw_type(&ctx, "__php_invoke args must be a Uint8Array")
             })?;
             let args = decode_args(bytes).map_err(|e| Exception::throw_type(&ctx, &e))?;
-            let result = {
-                let _guard = push_ctx(&ctx);
-                php_fn_call(&php_state, id as u64, args)
-            };
+            let result = php_fn_call(&php_state, id as u64, args);
             match result {
                 Ok(r) => encode_result(&ctx, r),
                 Err(err) => Err(throw_host_error(&ctx, &err)),
@@ -238,13 +232,18 @@ pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<
     ctx.eval::<(), _>(RUNTIME_JS)?;
     ctx.eval::<(), _>(build_facade(&state.names()))?;
 
-    // Release JS callbacks whose PHP wrappers were dropped since the last eval.
+    flush_pending_deletions(ctx, &state)
+}
+
+pub(crate) fn flush_pending_deletions(ctx: &Ctx<'_>, state: &BridgeState) -> rquickjs::Result<()> {
     let stale = state.take_pending_deletions();
     if !stale.is_empty() {
-        if let Ok(del) = globals.get::<_, Function>("__deleteJsFn") {
-            for id in stale {
-                let _ = del.call::<_, ()>((id as f64,));
-            }
+        // A fresh isolated realm has no registry; its preceding realm is gone.
+        let Ok(del) = ctx.globals().get::<_, Function>("__deleteJsFn") else {
+            return Ok(());
+        };
+        for id in stale {
+            del.call::<_, ()>((id as f64,))?;
         }
     }
     Ok(())
