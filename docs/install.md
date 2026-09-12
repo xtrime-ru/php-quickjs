@@ -108,8 +108,12 @@ Requires Rust 1.96+, clang, and PHP 8.4/8.5 dev headers (`php-config`).
 
 ```sh
 git clone https://github.com/eddmann/php-quickjs && cd php-quickjs
-make release      # -> target/release/libphp_quickjs.so (or .dylib on macOS)
-make test         # optional: Rust unit tests + PHP suite
+export PHP="$(command -v php)" PHP_CONFIG="$(command -v php-config)"
+cargo build --release # -> target/release/libphp_quickjs.so (or .dylib on macOS)
+cargo test --lib
+# Do not export PHP when invoking Makefile: it adds the extension flag itself.
+unset PHP
+make test-php PROFILE=release
 ```
 
 To build a Lambda-compatible binary locally, build inside the Bref image so it

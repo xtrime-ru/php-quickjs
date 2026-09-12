@@ -10,7 +10,8 @@ else
 CARGO_FLAGS :=
 endif
 
-EXT := $(CURDIR)/target/$(PROFILE)/libphp_quickjs.so
+EXT_SUFFIX := $(if $(filter Darwin,$(shell uname -s)),dylib,so)
+EXT := $(CURDIR)/target/$(PROFILE)/libphp_quickjs.$(EXT_SUFFIX)
 PHP := php -d extension=$(EXT)
 
 .PHONY: all build release test test-rust test-php stubs example clean fmt

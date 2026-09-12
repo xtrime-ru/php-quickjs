@@ -90,7 +90,7 @@ Or build from source (Rust 1.96+, clang, PHP dev headers — a plain cargo `cdyl
 
 ```sh
 git clone https://github.com/eddmann/php-quickjs && cd php-quickjs
-make build
+make release
 ```
 
 → Full platform matrix, Docker, and AWS Lambda / Bref instructions:
