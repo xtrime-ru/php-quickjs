@@ -47,3 +47,38 @@ the active instance is rejected; use a saved JS callback for synchronous reentry
 The execution deadline interrupts JavaScript, not blocking PHP/C code in a host
 callback. Keep host callbacks short. The extension remains single-threaded/NTS;
 Fiber support does not add ZTS or parallel-thread support.
+
+## Batched direct dispatch
+
+`Js\Callback::dispatch(?array $args, int $maxJobs = 100)` invokes a saved
+callback with a positional argument list, then executes at most `maxJobs` Promise
+jobs. Passing `null` skips invocation and only advances queued jobs. Its result is
+`['messages' => [[kind, payload], ...], 'jobs' => int, 'pending' => bool]`.
+
+```php
+$dispatch = $js->eval('(kind, payload) => __quickjsEmit(kind, payload)');
+$batch = $dispatch->dispatch(['result', ['answer' => 42]]);
+// $batch['messages'] === [['result', ['answer' => 42]]]
+```
+
+During a batch, guest code can call `__quickjsEmit(kind, payload)` to enqueue a
+message without invoking PHP. The host processes the returned messages after
+QuickJS returns, so asynchronous PHP handlers may suspend safely there. Emitting
+outside `dispatch()` throws. Dispatch uses native value conversion without
+a MessagePack encode/decode round trip; valid UTF-8 strings stay strings and
+binary PHP strings become `Uint8Array` and round-trip byte-for-byte.
+
+Message payloads accept null, booleans, numbers, strings, `Uint8Array`, arrays and
+objects containing data; functions are rejected. JS conversion allows at most
+64 nesting levels and 16 MiB of accounted payload storage, including container
+overhead. A batch queue allows 4096 messages and 32 MiB of accounted storage.
+These host-side caps are separate from QuickJS's `memoryLimit`. Cycles, oversized
+values and queue overflow throw JS errors. PHP input nesting is also limited to
+64 levels. Errors escaping a batch discard its partial messages; remaining
+Promise jobs stay queued, so applications must decide whether to resume or
+abandon that operation. Callback return values are ignored.
+
+Timeouts are checked between jobs as well as by QuickJS's interrupt hook. A
+blocking PHP callback cannot be interrupted, but no further job starts after
+its batch deadline has elapsed. Dropped callback registry entries are reclaimed
+at the next outer engine entry, including callback-only and job-only loops.

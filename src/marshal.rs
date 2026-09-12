@@ -215,6 +215,15 @@ pub fn js_to_middle<'js>(
     js_to_middle_bounded(ctx, value, _state, 0, &mut 16_777_216, true)
 }
 
+/// Direct messages accept data only and share one allocation budget per payload.
+pub fn js_to_data<'js>(
+    ctx: &Ctx<'js>,
+    value: Value<'js>,
+    state: &BridgeState,
+) -> rquickjs::Result<MiddleValue> {
+    js_to_middle_bounded(ctx, value, state, 0, &mut 16_777_216, false)
+}
+
 fn js_to_middle_bounded<'js>(
     ctx: &Ctx<'js>,
     value: Value<'js>,

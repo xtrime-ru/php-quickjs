@@ -65,3 +65,12 @@ Promise rejections retain JavaScript semantics: use `.catch()`/rejection handler
 
 See [asynchronous execution](async.md) for host event loop integration and PHP
 Fiber boundaries.
+
+### `Js\Callback::dispatch(?array $args, int $maxJobs = 100): array`
+
+Invoke a saved callback and collect direct guest messages while advancing a
+bounded Promise job batch. `null` arguments only drain jobs. Returns
+`array{messages: list<array{string, mixed}>, jobs: int, pending: bool}`.
+Requires shared mode and cannot be called reentrantly. See
+[batched direct dispatch](async.md#batched-direct-dispatch) for the message
+format, error recovery and limits.

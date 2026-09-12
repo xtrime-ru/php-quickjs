@@ -11,7 +11,7 @@ use crate::engine::Engine;
 use crate::error::{throw_host_error, HostError};
 use crate::handles::HandleTable;
 use crate::manifest::ManifestEntry;
-use crate::marshal::{middle_to_zval, zval_to_middle, MiddleValue};
+use crate::marshal::{js_to_data, middle_to_zval, zval_to_middle, MiddleValue};
 use ext_php_rs::convert::IntoZvalDyn;
 use ext_php_rs::types::{ZendCallable, Zval};
 use rquickjs::{Ctx, Exception, Function, TypedArray, Value};
@@ -41,6 +41,9 @@ pub struct BridgeState {
     /// JS-callback ids whose PHP wrapper was dropped, awaiting release from the
     /// JS registry (deferred to the next eval boundary; see `JsCallback::drop`).
     pending_fn_deletions: RefCell<Vec<u64>>,
+    pub messages: RefCell<Vec<MiddleValue>>,
+    pub collecting: Cell<bool>,
+    pub message_bytes: Cell<usize>,
 }
 
 impl BridgeState {
@@ -185,6 +188,40 @@ fn encode_result<'js>(ctx: &Ctx<'js>, result: MiddleValue) -> rquickjs::Result<V
 pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<()> {
     let globals = ctx.globals();
 
+    // Explicit data-only output queue for dispatch. No PHP callback runs here.
+    let queue_state = state.clone();
+    globals.set(
+        "__quickjsEmit",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, kind: String, payload: Value<'js>| -> rquickjs::Result<()> {
+                if !queue_state.collecting.get() {
+                    return Err(Exception::throw_type(
+                        &ctx,
+                        "__quickjsEmit requires dispatch",
+                    ));
+                }
+                let value = js_to_data(&ctx, payload, &queue_state)?;
+                let size = message_size(&value)
+                    .saturating_add(kind.len())
+                    .saturating_add(128);
+                let total = queue_state.message_bytes.get().saturating_add(size);
+                if total > 33_554_432 || queue_state.messages.borrow().len() >= 4096 {
+                    return Err(Exception::throw_type(
+                        &ctx,
+                        "dispatch message queue limit exceeded",
+                    ));
+                }
+                queue_state.message_bytes.set(total);
+                queue_state
+                    .messages
+                    .borrow_mut()
+                    .push(MiddleValue::Array(vec![MiddleValue::Str(kind), value]));
+                Ok(())
+            },
+        )?,
+    )?;
+
     // The single JS -> host capability entry point.
     let host_state = state.clone();
     let host = Function::new(
@@ -295,5 +332,16 @@ mod tests {
         assert!(src.contains("php[\"db\"][\"query\"] = function()"));
         assert!(src.contains("callHost(\"db.query\""));
         assert!(src.contains("Object.freeze"));
+    }
+}
+
+// Conservative allocation accounting includes each value/container slot.
+fn message_size(value: &MiddleValue) -> usize {
+    64 + match value {
+        MiddleValue::Str(s) => s.len(),
+        MiddleValue::Bytes(b) => b.len(),
+        MiddleValue::Array(a) => a.iter().map(message_size).sum(),
+        MiddleValue::Map(m) => m.iter().map(|(k, v)| k.len() + message_size(v)).sum(),
+        _ => 0,
     }
 }
