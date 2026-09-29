@@ -19,6 +19,26 @@ Releases attach these artifacts (per PHP 8.4 / 8.5, NTS):
 
 ## Self-hosted (Linux / macOS / Docker)
 
+For local development without installing Rust, PHP headers, or Composer on the
+host, use the included development image:
+
+```sh
+docker compose run --rm --build dev
+docker compose run --rm --build dev make release
+```
+
+`Dockerfile-dev` pins PHP 8.5 and Rust 1.96.1. Compose mounts the checkout at
+`/workspace`, writes build artifacts to `target/docker`, and keeps Cargo and
+Composer downloads in `.cache/cargo` and `.cache/composer` (ignored by Git).
+It creates no Docker-managed volumes.
+
+The default command runs the test suite after installing Composer dependencies.
+Pass another command to run tools in the same environment, for example:
+
+```sh
+docker compose run --rm dev cargo fmt --check
+```
+
 Download the `.so`/`.dylib` matching your PHP version and arch, then enable it:
 
 ```ini

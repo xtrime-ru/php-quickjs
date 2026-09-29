@@ -1,0 +1,33 @@
+FROM composer:2 AS composer
+
+FROM php:8.5-cli-bookworm
+
+ARG RUST_VERSION=1.96.1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        clang \
+        curl \
+        git \
+        libclang-dev \
+        make \
+        pkg-config \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_HOME=/opt/cargo \
+    RUSTUP_HOME=/opt/rustup \
+    PATH=/opt/cargo/bin:${PATH}
+
+COPY --from=composer /usr/bin/composer /usr/local/bin/composer
+
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && rustup component add rustfmt clippy --toolchain "${RUST_VERSION}"
+
+WORKDIR /workspace
+
+ENV CARGO_TARGET_DIR=/workspace/target/docker
+
+CMD ["make", "test"]

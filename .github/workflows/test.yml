@@ -31,7 +31,7 @@ jobs:
           phpts: nts
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.96
+        uses: dtolnay/rust-toolchain@1.96.1
         with:
           components: rustfmt
 
@@ -54,6 +54,7 @@ jobs:
 
       - name: PHP integration suite
         run: |
+          composer install --no-interaction --prefer-dist
           EXT="$(pwd)/target/debug/libphp_quickjs.so"
           php -d extension="$EXT" -r 'exit(class_exists("QuickJS") ? 0 : 1);' \
             || { echo "extension failed to load"; exit 1; }

@@ -93,6 +93,15 @@ git clone https://github.com/eddmann/php-quickjs && cd php-quickjs
 make release
 ```
 
+To build and test with PHP 8.5 + Rust 1.96.1 in Docker:
+
+```sh
+docker compose run --rm --build dev
+```
+
+The repository is mounted at `/workspace`; Cargo output stays in
+`target/docker`, and dependency caches stay under `.cache/`.
+
 → Full platform matrix, Docker, and AWS Lambda / Bref instructions:
 **[docs/install.md](docs/install.md)**.
 
