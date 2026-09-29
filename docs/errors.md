@@ -68,7 +68,7 @@ it. On a throw, `error.rs` reads the JS stack (generated-JS coordinates), and fo
 each frame referencing the guest module it looks the position up in the module's
 **source map** (kept host-side from transpilation) and rewrites it to the
 original TS `line:col`. Frames that don't reference the guest module — the
-`__rt`/facade plumbing — are dropped.
+facade plumbing — are dropped.
 
 ### Non-`Error` throws are surfaced, not lost
 

@@ -16,7 +16,7 @@ bounds the complete call, including Promise waits; `null` disables it.
 
 Expose a PHP callable to JS under a flat, dotted name — it becomes
 `php.<dotted.name>(...)` in the guest. `$types` is an optional TypeScript signature
-surfaced by `dts()`. This flat registry is the **entire** trust boundary.
+surfaced by `dts()`. This flat registry is the PHP callback allowlist.
 
 ### `eval(string $code): mixed`
 

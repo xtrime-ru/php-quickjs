@@ -98,7 +98,7 @@ holds only the integer id (in a `Js\Callback`). Two requirements pull against
 each other:
 
 1. **Persist across evals (shared mode).** The bridge is (re)installed every
-   eval; `runtime.js` is therefore guarded (`if (!globalThis.__rt) …`) so a
+   eval; `runtime.js` is therefore guarded (`if (!globalThis.__registerJsFn) …`) so a
    re-install does **not** recreate `jsFns`. The registry survives for the realm's
    life, so a stored callback keeps working after later evals.
 
@@ -106,7 +106,7 @@ each other:
    garbage-collected. But deletion can't happen *eagerly* in `Drop`: a JS function
    can round-trip PHP→JS within a single host call (e.g. `php.identity(fn)`
    returns `fn` straight back to JS), which drops a transient wrapper while JS
-   still needs the entry — deleting then would race the unwrap. So `Drop` only
+   still needs the entry — deleting then would race reconstruction. So `Drop` only
    **queues** the id (touching no JS, no locks), and the queued ids are flushed at
    the **next eval boundary**, when no round-trip is in flight.
 

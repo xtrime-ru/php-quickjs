@@ -1,26 +1,21 @@
-//! The trust boundary: one `__host` import into JS, a flat dispatch table of
-//! registered PHP callables, and the frozen `php.*` facade generated from the
-//! manifest.
-//!
-//! The `__host(name, argsBytes)` ABI is byte-based: the guest encodes its
-//! argument array to msgpack, the host decodes it, dispatches to the PHP
-//! callable, and returns the msgpack-encoded result. Adding a capability never
-//! changes this ABI.
+//! The trust boundary: native host imports dispatch registered PHP callables
+//! through a flat allowlist and the frozen `php.*` facade.
 
 use crate::engine::Engine;
 use crate::error::{throw_host_error, HostError};
 use crate::handles::HandleTable;
 use crate::manifest::ManifestEntry;
-use crate::marshal::{js_to_data, middle_to_zval, zval_to_middle, MiddleValue};
+use crate::marshal::{
+    js_to_data, js_to_middle, middle_to_js, middle_to_zval, zval_to_middle, MiddleValue,
+};
 use ext_php_rs::convert::IntoZvalDyn;
 use ext_php_rs::types::{ZendCallable, Zval};
-use rquickjs::{Ctx, Exception, Function, TypedArray, Value};
+use rquickjs::{Ctx, Exception, Function, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
-/// The msgpack codec and runtime support injected into every sandbox context.
-const MSGPACK_JS: &str = include_str!("js/msgpack.js");
+/// Runtime support injected into each context.
 const RUNTIME_JS: &str = include_str!("js/runtime.js");
 
 /// Shared host-side state behind the bridge. Single-threaded (PHP NTS), so
@@ -189,25 +184,27 @@ fn php_fn_call(
     call_php(&callable_zv, &args, state)
 }
 
-/// Decode the msgpack arg payload from a host import into a list of values.
-fn decode_args(bytes: &[u8]) -> Result<Vec<MiddleValue>, String> {
-    match MiddleValue::from_msgpack(bytes).map_err(|e| e.to_string())? {
-        MiddleValue::Array(a) => Ok(a),
-        other => Ok(vec![other]),
+fn invoke_host<'js>(
+    ctx: &Ctx<'js>,
+    state: &BridgeState,
+    payload: Value<'js>,
+    call: impl FnOnce(Vec<MiddleValue>) -> Result<MiddleValue, HostError>,
+) -> rquickjs::Result<Value<'js>> {
+    if !payload.is_array() {
+        return Err(Exception::throw_type(
+            ctx,
+            "host arguments must be an array",
+        ));
     }
+    let MiddleValue::Array(args) = js_to_middle(ctx, payload, state)? else {
+        unreachable!("a JS array converts to MiddleValue::Array")
+    };
+    let result = call(args).map_err(|error| throw_host_error(ctx, &error))?;
+    middle_to_js(ctx, &result)
 }
 
-/// Encode a host result back to a msgpack `Uint8Array` for JS.
-fn encode_result<'js>(ctx: &Ctx<'js>, result: MiddleValue) -> rquickjs::Result<Value<'js>> {
-    let out = result
-        .to_msgpack()
-        .map_err(|e| Exception::throw_type(ctx, &format!("encode failed: {e}")))?;
-    Ok(TypedArray::new(ctx.clone(), out)?.into_value())
-}
-
-/// Install the bridge into a context: the `__host`/`__php_invoke` native
-/// imports, the msgpack codec, the runtime support, and the frozen `php.*`
-/// facade. Call once per `eval`, before guest code runs.
+/// Install native imports, runtime support, and frozen
+/// `php.*` facade. Call once per `eval`, before guest code runs.
 pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<()> {
     let globals = ctx.globals();
 
@@ -231,23 +228,14 @@ pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<
         globals.set("quickjs", quickjs)?;
         ctx.eval::<(), _>("Object.freeze(globalThis.quickjs); Object.defineProperty(globalThis, 'quickjs', {value: globalThis.quickjs, writable: false, configurable: false})")?;
     }
-    // The single JS -> host capability entry point.
+    // JS -> PHP capability calls use the same native conversion as eval.
     let host_state = state.clone();
     let host = Function::new(
         ctx.clone(),
-        move |ctx: Ctx<'js>,
-              name: String,
-              args_bytes: TypedArray<'js, u8>|
-              -> rquickjs::Result<Value<'js>> {
-            let bytes = args_bytes
-                .as_bytes()
-                .ok_or_else(|| Exception::throw_type(&ctx, "__host args must be a Uint8Array"))?;
-            let args = decode_args(bytes).map_err(|e| Exception::throw_type(&ctx, &e))?;
-            let result = host_call(&host_state, &name, args);
-            match result {
-                Ok(r) => encode_result(&ctx, r),
-                Err(err) => Err(throw_host_error(&ctx, &err)),
-            }
+        move |ctx: Ctx<'js>, name: String, payload: Value<'js>| -> rquickjs::Result<Value<'js>> {
+            invoke_host(&ctx, &host_state, payload, |args| {
+                host_call(&host_state, &name, args)
+            })
         },
     )?;
     globals.set("__host", host)?;
@@ -256,25 +244,15 @@ pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<
     let php_state = state.clone();
     let php_invoke = Function::new(
         ctx.clone(),
-        move |ctx: Ctx<'js>,
-              id: f64,
-              args_bytes: TypedArray<'js, u8>|
-              -> rquickjs::Result<Value<'js>> {
-            let bytes = args_bytes.as_bytes().ok_or_else(|| {
-                Exception::throw_type(&ctx, "__php_invoke args must be a Uint8Array")
-            })?;
-            let args = decode_args(bytes).map_err(|e| Exception::throw_type(&ctx, &e))?;
-            let result = php_fn_call(&php_state, id as u64, args);
-            match result {
-                Ok(r) => encode_result(&ctx, r),
-                Err(err) => Err(throw_host_error(&ctx, &err)),
-            }
+        move |ctx: Ctx<'js>, id: f64, payload: Value<'js>| -> rquickjs::Result<Value<'js>> {
+            invoke_host(&ctx, &php_state, payload, |args| {
+                php_fn_call(&php_state, id as u64, args)
+            })
         },
     )?;
     globals.set("__php_invoke", php_invoke)?;
 
-    // Codec, runtime support, then the frozen facade.
-    ctx.eval::<(), _>(MSGPACK_JS)?;
+    // Runtime support must precede the frozen facade.
     ctx.eval::<(), _>(RUNTIME_JS)?;
     ctx.eval::<(), _>(build_facade(&state.names()))?;
 
@@ -312,7 +290,7 @@ fn build_facade(names: &[String]) -> String {
         }
         let leaf = format!("{path}[{}]", js_string(parts[parts.len() - 1]));
         src.push_str(&format!(
-            "{leaf} = function(){{ return globalThis.__rt.callHost({}, Array.prototype.slice.call(arguments)); }};\n",
+            "{leaf} = function(){{ return globalThis.__host({}, Array.prototype.slice.call(arguments)); }};\n",
             js_string(name)
         ));
     }
@@ -339,7 +317,7 @@ mod tests {
         let src = build_facade(&["db.query".into(), "log.info".into()]);
         assert!(src.contains("php[\"db\"] = php[\"db\"] || {};"));
         assert!(src.contains("php[\"db\"][\"query\"] = function()"));
-        assert!(src.contains("callHost(\"db.query\""));
+        assert!(src.contains("__host(\"db.query\""));
         assert!(src.contains("Object.freeze"));
     }
 }

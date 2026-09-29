@@ -110,15 +110,15 @@ The repository is mounted at `/workspace`; Cargo output stays in
 ```
 PHP (trusted)  ──ext-php-rs──►  Rust bridge  ──rquickjs──►  QuickJS (untrusted)
    register()                  dispatch table                php.module.fn()
-   eval()                      __host(name, bytes)           frozen php.* facade
+   eval()                      __host(name, args)            frozen php.* facade
 ```
 
-Registered PHP capabilities go through one `__host` entry point and a flat
+Registered PHP capabilities go through one direct native entry point and a flat
 dispatch table; the namespaced `php.*` tree is frozen JS built from your
 registrations. The separate `quickjs.postMessage()` sink copies data into a
-bounded native queue. Host calls use MessagePack; eval, saved callbacks and
-messages use native conversion. Functions cross as registry references, and
-errors bridge both ways with TS source locations.
+bounded native queue. Host calls, eval, saved callbacks and messages use native
+conversion. Functions cross as registry references, and errors bridge both
+ways with TS source locations.
 
 → **[docs/architecture.md](docs/architecture.md)** for the full design.
 

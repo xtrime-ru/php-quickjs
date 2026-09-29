@@ -99,7 +99,7 @@ pub(crate) fn call_js<'js>(
     let mut call_args = rquickjs::function::Args::new(ctx.clone(), args.len());
     for arg in args {
         call_args
-            .push_arg(middle_to_js(ctx, arg, &engine.state).map_err(&map_error)?)
+            .push_arg(middle_to_js(ctx, arg).map_err(&map_error)?)
             .map_err(&map_error)?;
     }
     function.call_arg(call_args).map_err(map_error)

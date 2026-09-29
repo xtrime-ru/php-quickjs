@@ -226,7 +226,7 @@ impl QuickJS {
             // Runtime support must exist for any function reconstruction.
             bridge::install(ctx, state.clone())
                 .map_err(|e| PhpException::default(error::js_error_message(ctx, e)))?;
-            let js = middle_to_js(ctx, &middle, &state).map_err(to_php_err)?;
+            let js = middle_to_js(ctx, &middle).map_err(to_php_err)?;
             let back = js_to_middle(ctx, js, &state).map_err(to_php_err)?;
             middle_to_zval(&back, &state).map_err(PhpException::default)
         })

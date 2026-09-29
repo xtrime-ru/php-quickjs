@@ -1,30 +1,12 @@
-//! Value marshaling between three worlds via a neutral [`MiddleValue`]:
-//!
-//! ```text
-//!   JS Value  <->  MiddleValue  <->  PHP Zval
-//!                       |
-//!                  msgpack bytes  (the `__host` wire format)
-//! ```
-//!
-//! `MiddleValue` (de)serializes to **native** msgpack types (nil/bool/int/
-//! float/str/bin/array/map) — not serde's tagged-enum form — so a JS-side
-//! msgpack codec interoperates with it byte-for-byte.
+//! Value marshaling between JS values and PHP zvals through [`MiddleValue`].
 
 use crate::bridge::BridgeState;
 use crate::callback::JsCallback;
 use ext_php_rs::convert::IntoZval;
 use ext_php_rs::types::{ArrayKey, ZendClassObject, ZendHashTable, Zval};
 use rquickjs::{Array, Ctx, Function, Object, TypedArray, Value};
-use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
-use std::fmt;
-
-/// Reserved msgpack-map keys tagging a function reference across the wire.
-const JSFN_TAG: &str = "$__jsfn";
-const PHPFN_TAG: &str = "$__phpfn";
-
-/// The neutral, self-describing value that bridges JS, PHP and the wire.
-#[derive(Debug, Clone, PartialEq)]
+/// The neutral value that bridges JS and PHP.
+#[derive(Debug, Clone)]
 pub enum MiddleValue {
     Null,
     Bool(bool),
@@ -41,18 +23,6 @@ pub enum MiddleValue {
     JsFn(u64),
 }
 
-impl MiddleValue {
-    /// Encode to a msgpack byte payload (the `__host` wire form).
-    pub fn to_msgpack(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-        rmp_serde::to_vec(self)
-    }
-
-    /// Decode a msgpack byte payload.
-    pub fn from_msgpack(bytes: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
-        rmp_serde::from_slice(bytes)
-    }
-}
-
 /// Map an `f64` to an int when it is integral and fits an `i64`, else keep it
 /// a float. QuickJS already stores small integral numbers as int32, so this
 /// only ever promotes the larger integral doubles that JS cannot tag as int.
@@ -61,143 +31,6 @@ fn int_or_float(f: f64) -> MiddleValue {
         MiddleValue::Int(f as i64)
     } else {
         MiddleValue::Float(f)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// native-msgpack serde
-// ---------------------------------------------------------------------------
-
-impl Serialize for MiddleValue {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            MiddleValue::Null => s.serialize_unit(),
-            MiddleValue::Bool(b) => s.serialize_bool(*b),
-            MiddleValue::Int(i) => s.serialize_i64(*i),
-            MiddleValue::Float(f) => s.serialize_f64(*f),
-            MiddleValue::Str(v) => s.serialize_str(v),
-            MiddleValue::Bytes(b) => s.serialize_bytes(b),
-            MiddleValue::Array(items) => {
-                let mut seq = s.serialize_seq(Some(items.len()))?;
-                for it in items {
-                    seq.serialize_element(it)?;
-                }
-                seq.end()
-            }
-            MiddleValue::Map(entries) => {
-                let mut map = s.serialize_map(Some(entries.len()))?;
-                for (k, v) in entries {
-                    map.serialize_entry(k, v)?;
-                }
-                map.end()
-            }
-            // Function refs travel as single-entry tagged maps.
-            MiddleValue::PhpFn(id) => {
-                let mut map = s.serialize_map(Some(1))?;
-                map.serialize_entry(PHPFN_TAG, &(*id as i64))?;
-                map.end()
-            }
-            MiddleValue::JsFn(id) => {
-                let mut map = s.serialize_map(Some(1))?;
-                map.serialize_entry(JSFN_TAG, &(*id as i64))?;
-                map.end()
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for MiddleValue {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = MiddleValue;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a msgpack value")
-            }
-            fn visit_unit<E>(self) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Null)
-            }
-            fn visit_none<E>(self) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Null)
-            }
-            fn visit_bool<E>(self, v: bool) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Bool(v))
-            }
-            fn visit_i64<E>(self, v: i64) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Int(v))
-            }
-            fn visit_u64<E>(self, v: u64) -> Result<MiddleValue, E> {
-                Ok(i64::try_from(v).map_or(MiddleValue::Float(v as f64), MiddleValue::Int))
-            }
-            fn visit_f64<E>(self, v: f64) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Float(v))
-            }
-            fn visit_str<E>(self, v: &str) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Str(v.to_owned()))
-            }
-            fn visit_string<E>(self, v: String) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Str(v))
-            }
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Bytes(v.to_owned()))
-            }
-            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<MiddleValue, E> {
-                Ok(MiddleValue::Bytes(v))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<MiddleValue, A::Error> {
-                let mut out = Vec::new();
-                while let Some(it) = seq.next_element()? {
-                    out.push(it);
-                }
-                Ok(MiddleValue::Array(out))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<MiddleValue, A::Error> {
-                let mut out = Vec::new();
-                while let Some((k, v)) = map.next_entry::<MapKey, MiddleValue>()? {
-                    out.push((k.0, v));
-                }
-                // A single-entry map keyed by a reserved tag is a function ref.
-                if out.len() == 1 {
-                    if let (key, MiddleValue::Int(id)) = &out[0] {
-                        if key == JSFN_TAG {
-                            return Ok(MiddleValue::JsFn(*id as u64));
-                        }
-                        if key == PHPFN_TAG {
-                            return Ok(MiddleValue::PhpFn(*id as u64));
-                        }
-                    }
-                }
-                Ok(MiddleValue::Map(out))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-/// A map key coerced to a string (msgpack maps may key by non-string scalars).
-struct MapKey(String);
-impl<'de> Deserialize<'de> for MapKey {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct K;
-        impl<'de> Visitor<'de> for K {
-            type Value = MapKey;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a map key")
-            }
-            fn visit_str<E>(self, v: &str) -> Result<MapKey, E> {
-                Ok(MapKey(v.to_owned()))
-            }
-            fn visit_string<E>(self, v: String) -> Result<MapKey, E> {
-                Ok(MapKey(v))
-            }
-            fn visit_i64<E>(self, v: i64) -> Result<MapKey, E> {
-                Ok(MapKey(v.to_string()))
-            }
-            fn visit_u64<E>(self, v: u64) -> Result<MapKey, E> {
-                Ok(MapKey(v.to_string()))
-            }
-        }
-        d.deserialize_any(K)
     }
 }
 
@@ -375,11 +208,7 @@ impl<'js> JsConversion<'_, 'js> {
 }
 
 /// Convert the neutral representation into a JS value.
-pub fn middle_to_js<'js>(
-    ctx: &Ctx<'js>,
-    value: &MiddleValue,
-    _state: &BridgeState,
-) -> rquickjs::Result<Value<'js>> {
+pub fn middle_to_js<'js>(ctx: &Ctx<'js>, value: &MiddleValue) -> rquickjs::Result<Value<'js>> {
     Ok(match value {
         MiddleValue::Null => Value::new_null(ctx.clone()),
         MiddleValue::Bool(b) => Value::new_bool(ctx.clone(), *b),
@@ -397,14 +226,14 @@ pub fn middle_to_js<'js>(
         MiddleValue::Array(items) => {
             let arr = Array::new(ctx.clone())?;
             for (i, it) in items.iter().enumerate() {
-                arr.set(i, middle_to_js(ctx, it, _state)?)?;
+                arr.set(i, middle_to_js(ctx, it)?)?;
             }
             arr.into_value()
         }
         MiddleValue::Map(entries) => {
             let obj = Object::new(ctx.clone())?;
             for (k, v) in entries {
-                obj.set(k.as_str(), middle_to_js(ctx, v, _state)?)?;
+                obj.set(k.as_str(), middle_to_js(ctx, v)?)?;
             }
             obj.into_value()
         }
@@ -579,55 +408,4 @@ pub fn middle_to_zval(value: &MiddleValue, state: &BridgeState) -> Result<Zval, 
         }
     }
     Ok(zv)
-}
-
-/// Helper so callers can build a Zval from any `IntoZval` (used by tests).
-#[allow(dead_code)]
-pub fn into_zval<T: IntoZval>(v: T) -> Result<Zval, String> {
-    v.into_zval(false).map_err(|e| e.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn roundtrip(v: MiddleValue) {
-        let bytes = v.to_msgpack().expect("encode");
-        let back = MiddleValue::from_msgpack(&bytes).expect("decode");
-        assert_eq!(v, back);
-    }
-
-    #[test]
-    fn msgpack_scalars() {
-        roundtrip(MiddleValue::Null);
-        roundtrip(MiddleValue::Bool(true));
-        roundtrip(MiddleValue::Int(-42));
-        roundtrip(MiddleValue::Int(1 << 40));
-        roundtrip(MiddleValue::Float(3.5));
-        roundtrip(MiddleValue::Str("héllo".to_owned()));
-        roundtrip(MiddleValue::Bytes(vec![0, 1, 2, 255]));
-    }
-
-    #[test]
-    fn msgpack_nested() {
-        roundtrip(MiddleValue::Array(vec![
-            MiddleValue::Int(1),
-            MiddleValue::Str("two".into()),
-            MiddleValue::Bool(false),
-        ]));
-        roundtrip(MiddleValue::Map(vec![
-            ("a".into(), MiddleValue::Int(1)),
-            (
-                "nested".into(),
-                MiddleValue::Array(vec![MiddleValue::Null, MiddleValue::Float(2.5)]),
-            ),
-        ]));
-    }
-
-    #[test]
-    fn bytes_encode_as_msgpack_bin() {
-        // msgpack bin8 marker is 0xc4; ensure bytes do not serialize as an array.
-        let bytes = MiddleValue::Bytes(vec![1, 2, 3]).to_msgpack().unwrap();
-        assert_eq!(bytes[0], 0xc4);
-    }
 }

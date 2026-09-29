@@ -6,7 +6,7 @@
 ┌─ PHP (trusted, full Zend) ──┐   ┌─ Rust extension ─┐   ┌─ QuickJS (untrusted) ─┐
 │ $js->register(...)          │   │  owns the engine  │   │  php.module.fn()       │
 │ $js->eval(tsCode)           │◄─►│  host capabilities│◄─►│  frozen php.* facade   │
-│ $js->grant($obj)            │   │  msgpack marshal  │   │  guest TS-as-JS        │
+│ $js->grant($obj)            │   │  native marshal   │   │  guest TS-as-JS        │
 └─────────────────────────────┘   └───────────────────┘   └────────────────────────┘
         ext-php-rs (zval ↔ Rust)        rquickjs (Rust ↔ JSValue)
 ```
@@ -34,32 +34,29 @@ Take `php.math.add(2, 3)` from a guest script.
 
    ```js
    php.math.add = function () {
-     return globalThis.__rt.callHost("math.add", Array.prototype.slice.call(arguments));
+     return globalThis.__host("math.add", Array.prototype.slice.call(arguments));
    };
    ```
 
-3. `__rt.callHost` (`src/js/runtime.js`) **msgpack-encodes** the argument array
-   and calls `__host("math.add", bytes)`.
-
-4. `__host` is the native entry point for registered PHP capabilities. In
+3. `__host` is the native entry point for registered PHP capabilities. In
    `bridge.rs` it:
-   - decodes the msgpack payload to a `MiddleValue` list,
+   - converts JS values to a `MiddleValue` list,
    - looks `"math.add"` up in the **dispatch table** (rejects if not registered —
      this is the trust boundary),
    - converts each arg `MiddleValue → zval`,
    - calls the PHP callable via `ZendCallable::try_call`.
 
-5. The result travels back `zval → MiddleValue → msgpack bytes`, and `__rt`
-   decodes it in the realm. `5` lands in the guest.
+4. The result travels back `zval → MiddleValue → JS value`. `5` lands in the
+   guest without a byte serialization round-trip.
 
-Adding a capability never changes this ABI: all registered capabilities use
+Adding a capability never changes the dispatch mechanism: all capabilities use
 one dispatch table. The flat, dotted-name list (`manifest()`) is the complete
 audit surface for PHP callables.
 
 ### The facade is generated, and frozen
 
 `bridge.rs::build_facade` walks the manifest's dotted names into a nested object
-tree, makes each leaf a function calling `__rt.callHost("dotted.name", args)`, then
+tree, makes each leaf a function calling `__host("dotted.name", args)`, then
 **deep-freezes** the whole tree. Freezing is a security requirement, not a
 nicety: a guest must not be able to reassign `php.http.get` to fool other code.
 The facade is (re)built at the start of every `eval` so newly registered
@@ -67,15 +64,12 @@ capabilities appear.
 
 ## Value marshaling
 
-Each side implements exactly one conversion against a neutral middle type,
-`marshal.rs::MiddleValue`, which (de)serializes to **native** msgpack (not
-serde's tagged-enum form), so the in-sandbox JS codec interoperates byte-for-byte.
+Each side converts against a neutral middle type, `marshal.rs::MiddleValue`.
+All values cross through native conversion.
 
 ```
 JS value  ──js_to_middle──►  MiddleValue  ──middle_to_zval──►  PHP zval
 JS value  ◄─middle_to_js───  MiddleValue  ◄─zval_to_middle───  PHP zval
-                                  │
-                            msgpack bytes        (the __host wire form)
 ```
 
 | JS                | MiddleValue | PHP                         |
@@ -94,25 +88,20 @@ Notes:
 - A PHP array with sequential `0..n` keys becomes a JS `Array`; otherwise a JS
   object. A non-UTF-8 PHP string crosses as bytes (a `Uint8Array`).
 - Integers beyond 2^53 lose precision when represented as JS numbers.
-- Why msgpack at all, in one process? It gives a clean, binary-safe, documented
-  ABI for the one `__host` import, and a single canonical serialization that both
-  the Rust and JS sides share.
 
 ## Bidirectional functions
 
-Functions can't be msgpack-encoded, so they cross as **tagged references** and
-the real callable is held in a registry on the owning side.
+Functions cross as **registry references**: the real callable remains on its
+owning side.
 
-- **`{"$__phpfn": id}`** — a PHP callable handed to JS. The callable is stored in
-  a host-side registry (`bridge.rs`); JS receives a wrapper function that routes
+- **`PhpFn(id)`** — a PHP callable handed to JS. The callable is stored in a
+  host-side registry (`bridge.rs`); JS receives a wrapper function that routes
   back through `__php_invoke(id, …)`.
-- **`{"$__jsfn": id}`** — a JS function handed to PHP. The function is stored in a
+- **`JsFn(id)`** — a JS function handed to PHP. The function is stored in a
   **JS-side** registry (`jsFns` in `runtime.js`); PHP receives a `Js\Callback`
   object holding the integer `id`.
 
-For JS → PHP calls, `wrap()` replaces functions with refs before encoding and
-`unwrap()` restores them after decoding. Saved JS callbacks use native value
-conversion in Rust.
+Rust converts these references without JS-side wrapping or decoding.
 
 ### Invoking a JS function from PHP
 

@@ -158,7 +158,7 @@ pub fn js_error_to_php(ctx: &Ctx<'_>, err: JsError) -> PhpException {
 /// Remap a JS stack back to TypeScript coordinates, keeping only guest frames.
 ///
 /// Frames that reference `module_id` have their `:line:col` rewritten to the
-/// original TS position; internal host frames (the msgpack/runtime bootstrap
+/// original TS position; internal host frames (the runtime bootstrap
 /// and the `php.*` facade wrappers) are dropped so the trace reads like a plain
 /// TS stack. Returns `None` if the map cannot be parsed or no guest frame
 /// remains.
