@@ -19,6 +19,7 @@ eq(null, $m[1]['types'], 'untyped registration has null signature');
 // --- dts() is generated from the same manifest ---------------------------
 $dts = $js->dts();
 ok(str_contains($dts, 'declare const php:'), 'dts declares the php global');
+ok(str_contains($dts, 'declare const quickjs:'), 'dts declares the native message API');
 ok(str_contains($dts, 'db: {'), 'dts nests dotted names into namespaces');
 ok(str_contains($dts, 'query(handle: number, sql: string): unknown[];'), 'typed signature emitted verbatim');
 ok(str_contains($dts, 'execute(...args: any[]): any;'), 'untyped leaf falls back to any');

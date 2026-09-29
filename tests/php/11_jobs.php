@@ -15,6 +15,7 @@ throws(
     'async rejection becomes a PHP evaluation exception'
 );
 eq(42, $js->eval('({ then(resolve) { resolve(42); } })'), 'thenables are awaited');
+eq(42, $js->eval('let chain = Promise.resolve(42); for (let i = 0; i < 100; i++) chain = chain.then(value => value); chain'), 'settled Promise at quantum boundary needs no event loop');
 eq(42, $js->eval('({ get then() { if (this.read) throw new Error("then read twice"); this.read = true; return resolve => resolve(42); } })'), 'thenable getter is read once');
 eq(42, (new QuickJS(isolated: true))->eval('(async () => { await 0; return 42; })()'), 'isolated eval awaits its Promise');
 $stop = new QuickJS();

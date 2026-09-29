@@ -46,6 +46,37 @@ $js->register('all', static function ($callback) use (&$futures): void {
 eq(45, $js->eval('new Promise(resolve => { let count = 0, sum = 0; php.all(n => { sum += n; if (++count === 10) resolve(sum); return n * 2; }); })'), 'multiple event-loop callbacks settle one Promise');
 eq(range(0, 18, 2), array_map(static fn($future) => $future->await(), $futures), 'each queued caller receives its own result');
 
+$first = $js->eval('() => new Promise(resolve => { globalThis.resolveFirst = resolve; })');
+$second = $js->eval('resolveOwner => { resolveFirst(41); resolveOwner(7); return 42; }');
+$js->register('startConcurrent', static function ($resolveOwner) use ($first, $second, &$futures): void {
+    $futures = [
+        Amp\async(static fn() => $first()),
+        Amp\async(static fn() => $second($resolveOwner)),
+    ];
+});
+eq(7, $js->eval('new Promise(resolve => php.startConcurrent(resolve))'), 'second callback can settle the first pending Promise');
+eq([41, 42], array_map(static fn($future) => $future->await(), $futures), 'concurrent callback results resume independently');
+
+$waiting = $js->eval('() => new Promise(resolve => { globalThis.finishWaiting = resolve; })');
+$js->register('startPending', static function ($resolveOwner) use ($waiting, &$future): void {
+    $future = Amp\async(static fn() => $waiting());
+    Revolt\EventLoop::defer(static fn() => $resolveOwner(8));
+});
+eq(8, $js->eval('new Promise(resolve => php.startPending(resolve))'), 'owner may finish while a callback Promise is pending');
+$js->eval('finishWaiting(43)');
+$js->executePendingJobs();
+eq(43, $future->await(), 'pending callback survives the owner entry');
+
+$fair = new QuickJS(timeoutMs: 1000);
+$stop = $fair->eval('() => { globalThis.stopped = true; }');
+$fair->register('scheduleStop', static function () use ($stop): void {
+    Revolt\EventLoop::delay(0.001, static fn() => $stop());
+});
+eq(1, $fair->eval('globalThis.stopped = false; php.scheduleStop(); new Promise(resolve => {
+    function spin() { if (stopped) resolve(1); else Promise.resolve().then(spin); }
+    spin();
+})'), 'microtask chain yields to Revolt timers');
+
 $limited = new QuickJS(timeoutMs: 20);
 $start = hrtime(true);
 throws(fn() => $limited->eval('new Promise(() => {})'), QuickJSTimeoutException::class, 'external wait obeys timeoutMs');

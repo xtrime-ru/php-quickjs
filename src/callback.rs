@@ -7,10 +7,10 @@
 
 use crate::engine::Engine;
 use crate::marshal::{
-    arguments_to_middle, data_arguments, js_to_middle, middle_to_js, middle_to_zval, MiddleValue,
+    arguments_to_middle, js_to_middle, middle_to_js, middle_to_zval, MiddleValue,
 };
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ZendHashTable, Zval};
+use ext_php_rs::types::Zval;
 use rquickjs::{Ctx, Function, Value};
 use std::rc::Rc;
 
@@ -74,11 +74,20 @@ pub(crate) fn invoke_callback(
     let map_error = |e| engine.callback_error(ctx, e);
     let value = call_js(ctx, engine, id, args)?;
     let value = engine.await_value(ctx, value, map_error)?;
+    finish_callback(ctx, engine, value)
+}
+
+pub(crate) fn finish_callback<'js>(
+    ctx: &Ctx<'js>,
+    engine: &Engine,
+    value: Value<'js>,
+) -> PhpResult<Zval> {
+    let map_error = |e| engine.callback_error(ctx, e);
     let middle = js_to_middle(ctx, value, &engine.state).map_err(map_error)?;
     middle_to_zval(&middle, &engine.state).map_err(PhpException::default)
 }
 
-fn call_js<'js>(
+pub(crate) fn call_js<'js>(
     ctx: &Ctx<'js>,
     engine: &Engine,
     id: u64,
@@ -98,54 +107,6 @@ fn call_js<'js>(
 
 #[php_impl]
 impl JsCallback {
-    /// Direct, data-only dispatch followed by a bounded job batch. Pass null
-    /// instead of an argument list to continue jobs without invoking the callback.
-    /// Returns queued messages, executed job count, and pending-job status.
-    #[php(defaults(maxJobs = 100))]
-    pub fn dispatch(&self, args: Option<&ZendHashTable>, maxJobs: i64) -> PhpResult<Zval> {
-        if maxJobs <= 0 {
-            return Err(PhpException::default(
-                "maxJobs must be greater than zero".to_owned(),
-            ));
-        }
-        if self.engine.shared_ctx().is_none() {
-            return Err(PhpException::default(
-                "dispatch requires shared mode".to_owned(),
-            ));
-        }
-        if self.engine.is_active() {
-            return Err(PhpException::default(
-                "Cannot dispatch while JavaScript is executing".to_owned(),
-            ));
-        }
-        let middle = args
-            .map(|args| data_arguments(args, &self.engine.state))
-            .transpose()
-            .map_err(PhpException::default)?;
-        let _guard = self.engine.enter().map_err(PhpException::default)?;
-        let _batch = self.engine.state.begin_batch();
-        self.engine.eval_in(|ctx| {
-            if let Some(MiddleValue::Array(items)) = &middle {
-                // Dispatch is a notification; its return value is deliberately ignored.
-                call_js(ctx, &self.engine, self.id, items)?;
-            }
-            let jobs = self.engine.run_jobs(ctx, maxJobs)?;
-            let pending = unsafe {
-                rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()))
-            };
-            let messages = self.engine.state.take_messages();
-            middle_to_zval(
-                &MiddleValue::Map(vec![
-                    ("messages".to_owned(), MiddleValue::Array(messages)),
-                    ("jobs".to_owned(), MiddleValue::Int(jobs)),
-                    ("pending".to_owned(), MiddleValue::Bool(pending)),
-                ]),
-                &self.engine.state,
-            )
-            .map_err(PhpException::default)
-        })
-    }
-
     /// Invoke the JS callback: `$cb(...$args)`.
     pub fn __invoke(&self, args: &[&Zval]) -> PhpResult<Zval> {
         self.invoke_inner(args)

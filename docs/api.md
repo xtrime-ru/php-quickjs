@@ -4,11 +4,13 @@ The extension exposes a single `QuickJS` class. For the bigger picture see
 [architecture](architecture.md); for realms and the callback lifecycle see
 [execution modes](execution-modes.md).
 
-### `new QuickJS(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false)`
+### `new QuickJS(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false, ?int $maxQueuedMessageBytes = null)`
 
 Limits default to unbounded; pass non-zero values to contain resource abuse.
 `isolated: true` runs each `eval()` in a fresh realm (see
 [execution modes](execution-modes.md)).
+`maxQueuedMessageBytes` defaults to 32 MiB and must be positive. `timeoutMs`
+bounds the complete call, including Promise waits; `null` disables it.
 
 ### `register(string $name, callable $fn, ?string $types = null): void`
 
@@ -35,8 +37,8 @@ $js->register('db.query', fn(int $handle, string $sql) => $js->resolve($handle)-
 
 ### `manifest(): array` / `dts(): string`
 
-The registration manifest and a generated TypeScript `.d.ts` for the `php` global,
-both from the same source of truth.
+The registration manifest and generated TypeScript `.d.ts` for the `php` and
+`quickjs` globals. The `php` declaration comes from the registration manifest.
 
 ### `roundtrip(mixed $value): mixed`
 
@@ -68,11 +70,8 @@ Promise rejections retain JavaScript semantics: use `.catch()`/rejection handler
 See [asynchronous execution](async.md) for host event loop integration and PHP
 Fiber boundaries.
 
-### `Js\Callback::dispatch(?array $args, int $maxJobs = 100): array`
+### `drainMessages(): array`
 
-Invoke a saved callback and collect direct guest messages while advancing a
-bounded Promise job batch. `null` arguments only drain jobs. Returns
-`array{messages: list<array{string, mixed}>, jobs: int, pending: bool}`.
-Requires shared mode and cannot be called reentrantly. See
-[batched direct dispatch](async.md#batched-direct-dispatch) for the message
-format, error recovery and limits.
+Return and clear messages sent by JS through `quickjs.postMessage(value)`.
+Values are copied at send time and contain data only. This method does not
+enter JS or execute jobs. See [asynchronous execution](async.md) for limits.

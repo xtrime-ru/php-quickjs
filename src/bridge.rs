@@ -41,12 +41,15 @@ pub struct BridgeState {
     /// JS-callback ids whose PHP wrapper was dropped, awaiting release from the
     /// JS registry (deferred to the next eval boundary; see `JsCallback::drop`).
     pending_fn_deletions: RefCell<Vec<u64>>,
-    batch: RefCell<Option<MessageBatch>>,
+    messages: RefCell<MessageQueue>,
 }
 
 impl BridgeState {
-    pub fn new() -> Rc<Self> {
-        Rc::new(Self::default())
+    pub fn new(max_queued_message_bytes: usize) -> Rc<Self> {
+        Rc::new(Self {
+            messages: RefCell::new(MessageQueue::new(max_queued_message_bytes)),
+            ..Self::default()
+        })
     }
 
     /// Queue a JS-callback id for release at the next eval boundary.
@@ -108,16 +111,16 @@ impl BridgeState {
         drop(removed);
     }
 
-    pub(crate) fn begin_batch(&self) -> BatchGuard<'_> {
-        *self.batch.borrow_mut() = Some(MessageBatch::default());
-        BatchGuard { state: self }
+    fn push_message(&self, value: MiddleValue, bytes: usize) -> Result<(), &'static str> {
+        self.messages.borrow_mut().push(value, bytes)
     }
 
-    pub(crate) fn take_messages(&self) -> Vec<MiddleValue> {
-        self.batch
-            .borrow_mut()
-            .take()
-            .map_or_else(Vec::new, |batch| batch.messages)
+    fn message_capacity(&self) -> usize {
+        self.messages.borrow().remaining()
+    }
+
+    pub(crate) fn drain_messages(&self) -> Vec<MiddleValue> {
+        self.messages.borrow_mut().drain()
     }
 
     pub fn get_php_fn(&self, id: u64) -> Option<Zval> {
@@ -208,34 +211,26 @@ fn encode_result<'js>(ctx: &Ctx<'js>, result: MiddleValue) -> rquickjs::Result<V
 pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<()> {
     let globals = ctx.globals();
 
-    // Explicit data-only output queue for dispatch. No PHP callback runs here.
-    let queue_state = state.clone();
-    globals.set(
-        "__quickjsEmit",
-        Function::new(
+    // Snapshot before borrowing the queue: getters can execute arbitrary JS.
+    if globals
+        .get::<_, Option<rquickjs::Object>>("quickjs")?
+        .is_none()
+    {
+        let message_state = state.clone();
+        let post_message = Function::new(
             ctx.clone(),
-            move |ctx: Ctx<'js>, kind: String, payload: Value<'js>| -> rquickjs::Result<()> {
-                if queue_state.batch.borrow().is_none() {
-                    return Err(Exception::throw_type(
-                        &ctx,
-                        "__quickjsEmit requires dispatch",
-                    ));
-                }
-                // Conversion may invoke getters, including nested emit calls;
-                // never hold the queue borrow while JavaScript can execute.
-                let (value, bytes) = js_to_data(&ctx, payload)?;
-                let mut active = queue_state.batch.borrow_mut();
-                let batch = active
-                    .as_mut()
-                    .ok_or_else(|| Exception::throw_type(&ctx, "inactive dispatch"))?;
-                batch
-                    .push(kind, value, bytes)
-                    .map_err(|e| Exception::throw_type(&ctx, e))?;
-                Ok(())
+            move |ctx: Ctx<'js>, payload: Value<'js>| -> rquickjs::Result<()> {
+                let (value, bytes) = js_to_data(&ctx, payload, message_state.message_capacity())?;
+                message_state
+                    .push_message(value, bytes)
+                    .map_err(|e| Exception::throw_type(&ctx, e))
             },
-        )?,
-    )?;
-
+        )?;
+        let quickjs = rquickjs::Object::new(ctx.clone())?;
+        quickjs.set("postMessage", post_message)?;
+        globals.set("quickjs", quickjs)?;
+        ctx.eval::<(), _>("Object.freeze(globalThis.quickjs); Object.defineProperty(globalThis, 'quickjs', {value: globalThis.quickjs, writable: false, configurable: false})")?;
+    }
     // The single JS -> host capability entry point.
     let host_state = state.clone();
     let host = Function::new(
@@ -349,37 +344,46 @@ mod tests {
     }
 }
 
-const MAX_BATCH_MESSAGES: usize = 4096;
-const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_QUEUED_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MESSAGE_OVERHEAD: usize = 128;
 
+/// Detached data snapshots waiting for a PHP drain.
 #[derive(Default)]
-struct MessageBatch {
+struct MessageQueue {
     messages: Vec<MiddleValue>,
     bytes: usize,
+    limit: usize,
 }
-impl MessageBatch {
-    fn push(&mut self, kind: String, value: MiddleValue, bytes: usize) -> Result<(), &'static str> {
+impl MessageQueue {
+    fn new(limit: usize) -> Self {
+        Self {
+            messages: Vec::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn push(&mut self, value: MiddleValue, bytes: usize) -> Result<(), &'static str> {
         let total = self
             .bytes
             .saturating_add(bytes)
-            .saturating_add(kind.len())
             .saturating_add(MESSAGE_OVERHEAD);
-        if total > MAX_BATCH_BYTES || self.messages.len() >= MAX_BATCH_MESSAGES {
-            return Err("dispatch message queue limit exceeded");
+        if total > self.limit {
+            return Err("message queue limit exceeded");
         }
         self.bytes = total;
-        self.messages
-            .push(MiddleValue::Array(vec![MiddleValue::Str(kind), value]));
+        self.messages.push(value);
         Ok(())
     }
-}
 
-pub(crate) struct BatchGuard<'a> {
-    state: &'a BridgeState,
-}
-impl Drop for BatchGuard<'_> {
-    fn drop(&mut self) {
-        self.state.batch.borrow_mut().take();
+    fn drain(&mut self) -> Vec<MiddleValue> {
+        self.bytes = 0;
+        std::mem::take(&mut self.messages)
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit
+            .saturating_sub(self.bytes)
+            .saturating_sub(MESSAGE_OVERHEAD)
     }
 }

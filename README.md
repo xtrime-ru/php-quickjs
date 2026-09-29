@@ -113,11 +113,12 @@ PHP (trusted)  ──ext-php-rs──►  Rust bridge  ──rquickjs──►  
    eval()                      __host(name, bytes)           frozen php.* facade
 ```
 
-Everything the guest reaches goes through a single `__host` import and a flat dispatch
-table; the namespaced `php.*` tree is frozen JS built from your registrations. Host
-calls use MessagePack; eval and saved callbacks use native conversion. Functions
-cross as registry references, and errors bridge
-both ways — remapping to TS coordinates on the way out.
+Registered PHP capabilities go through one `__host` entry point and a flat
+dispatch table; the namespaced `php.*` tree is frozen JS built from your
+registrations. The separate `quickjs.postMessage()` sink copies data into a
+bounded native queue. Host calls use MessagePack; eval, saved callbacks and
+messages use native conversion. Functions cross as registry references, and
+errors bridge both ways with TS source locations.
 
 → **[docs/architecture.md](docs/architecture.md)** for the full design.
 
@@ -127,6 +128,11 @@ both ways — remapping to TS coordinates on the way out.
 yields through Revolt using php-tokio's Fiber model; rejections become PHP
 exceptions. Manual job APIs remain available for detached work. See
 [asynchronous execution](docs/async.md).
+
+Async consumers can send data-only notifications with `quickjs.postMessage(value)`
+and read them using `QuickJS::drainMessages()`. The native queue snapshots values
+at send time and has a configurable aggregate byte limit. `timeoutMs` remains an
+optional wall-clock limit for a complete call, including Promise waits.
 
 ## Scope
 

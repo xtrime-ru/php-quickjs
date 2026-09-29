@@ -30,11 +30,13 @@ pub fn install_interrupt(
     deadline: Rc<Cell<Option<Instant>>>,
     timed_out: Rc<Cell<bool>>,
 ) {
-    rt.set_interrupt_handler(Some(Box::new(move || match deadline.get() {
-        Some(dl) if Instant::now() >= dl => {
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        let now = Instant::now();
+        if deadline.get().is_some_and(|dl| now >= dl) {
             timed_out.set(true);
             true
+        } else {
+            false
         }
-        _ => false,
     })));
 }

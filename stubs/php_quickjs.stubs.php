@@ -16,8 +16,9 @@ class QuickJS
      * @param int|null $timeoutMs   Per-eval/callback/job-batch wall-clock budget in ms (0/null = unbounded).
      * @param int|null $maxStack    Max native stack bytes (0/null = engine default).
      * @param bool     $isolated    Run each eval() in its own fresh global realm.
+     * @param int|null $maxQueuedMessageBytes Max accounted bytes in the message queue (null = 32 MiB).
      */
-    public function __construct(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false) {}
+    public function __construct(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false, ?int $maxQueuedMessageBytes = null) {}
 
     /**
      * Register a PHP callable under a flat, dotted capability name, callable
@@ -41,7 +42,10 @@ class QuickJS
     /** Execute at most maxJobs ready jobs without waiting for I/O; returns the count. */
     public function executePendingJobs(int $maxJobs = 100): int {}
 
-    /** Generate a TypeScript `.d.ts` declaration for the `php` global. */
+    /** Drain bounded messages emitted by quickjs.postMessage() without entering JS. */
+    public function drainMessages(): array {}
+
+    /** Generate TypeScript `.d.ts` declarations for the `php` and `quickjs` globals. */
     public function dts(): string {}
 
     /** Grant JS an opaque integer handle to a live PHP value. */
@@ -65,11 +69,6 @@ namespace Js {
      */
     class Callback
     {
-        /**
-         * @param list<scalar|array|null>|null $args Data-only positional arguments.
-         * @return array{messages: list<array{string, mixed}>, jobs: int, pending: bool}
-         */
-        public function dispatch(?array $args, int $maxJobs = 100): array {}
         /** Invoke the JS function, awaiting a returned Promise. */
         public function __invoke(mixed ...$args): mixed {}
 

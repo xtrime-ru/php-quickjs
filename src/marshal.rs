@@ -206,20 +206,19 @@ impl<'de> Deserialize<'de> for MapKey {
 // ---------------------------------------------------------------------------
 
 pub const MAX_VALUE_DEPTH: usize = 64;
-pub const MAX_DATA_BYTES: usize = 16 * 1024 * 1024;
 pub const VALUE_OVERHEAD: usize = 64;
 
-/// The direct transport has a byte budget; the generic API keeps its previous
-/// unlimited byte size. Both paths bound recursion before visiting a value.
+/// Messages have a byte budget; the generic API remains unbounded in bytes.
+/// Both paths bound recursion before visiting a value.
 #[derive(Default)]
 struct ConversionBudget {
     limit: Option<usize>,
     used: usize,
 }
 impl ConversionBudget {
-    fn direct() -> Self {
+    fn with_limit(limit: usize) -> Self {
         Self {
-            limit: Some(MAX_DATA_BYTES),
+            limit: Some(limit),
             used: 0,
         }
     }
@@ -271,10 +270,11 @@ pub fn js_to_middle<'js>(
 pub fn js_to_data<'js>(
     ctx: &Ctx<'js>,
     value: Value<'js>,
+    max_bytes: usize,
 ) -> rquickjs::Result<(MiddleValue, usize)> {
     let mut conversion = JsConversion {
         ctx,
-        budget: ConversionBudget::direct(),
+        budget: ConversionBudget::with_limit(max_bytes),
         functions: false,
         registered: Vec::new(),
     };
@@ -426,7 +426,7 @@ pub fn middle_to_js<'js>(
 
 /// Registrations are committed only once the complete input is valid.
 pub fn zval_to_middle(zv: &Zval, state: &BridgeState) -> Result<MiddleValue, String> {
-    let mut conversion = PhpConversion::new(state, true);
+    let mut conversion = PhpConversion::new(state);
     let value = conversion.convert(zv, 0)?;
     conversion.registered.clear();
     Ok(value)
@@ -436,7 +436,7 @@ pub fn arguments_to_middle(
     args: &[&Zval],
     state: &BridgeState,
 ) -> Result<Vec<MiddleValue>, String> {
-    let mut conversion = PhpConversion::new(state, true);
+    let mut conversion = PhpConversion::new(state);
     let result = args
         .iter()
         .map(|arg| conversion.convert(arg, 0))
@@ -445,31 +445,16 @@ pub fn arguments_to_middle(
     Ok(result)
 }
 
-pub fn data_arguments(args: &ZendHashTable, state: &BridgeState) -> Result<MiddleValue, String> {
-    if !args.has_sequential_keys() {
-        return Err("args must be a list or null".to_owned());
-    }
-    let mut conversion = PhpConversion::new(state, false);
-    conversion.budget.node(0)?;
-    conversion.array(args, 0)
-}
-
 struct PhpConversion<'a> {
     state: &'a BridgeState,
     budget: ConversionBudget,
-    functions: bool,
     registered: Vec<u64>,
 }
 impl<'a> PhpConversion<'a> {
-    fn new(state: &'a BridgeState, functions: bool) -> Self {
+    fn new(state: &'a BridgeState) -> Self {
         Self {
             state,
-            budget: if functions {
-                ConversionBudget::default()
-            } else {
-                ConversionBudget::direct()
-            },
-            functions,
+            budget: ConversionBudget::default(),
             registered: Vec::new(),
         }
     }
@@ -497,9 +482,6 @@ impl<'a> PhpConversion<'a> {
         }
         if let Some(array) = zv.array() {
             return self.array(array, depth);
-        }
-        if !self.functions {
-            return Err("direct dispatch arguments must contain data only".to_owned());
         }
         if let Some(cb) = zv.extract::<&ZendClassObject<JsCallback>>() {
             let owner = self.state.engine().ok_or("engine no longer available")?;

@@ -36,21 +36,35 @@ impl QuickJS {
     /// - `memoryLimit`: max heap bytes (alloc-bomb guard)
     /// - `timeoutMs`: wall-clock budget per eval, callback, or job batch
     /// - `maxStack`: max native stack bytes
+    /// - `maxQueuedMessageBytes`: maximum accounted bytes waiting in the message queue
     /// - `isolated`: when true, each `eval()` runs in a fresh global realm (its
     ///   own world); cross-eval globals and persistent JS callbacks are not
     ///   kept. Defaults to false (one shared, persistent realm per instance).
-    #[php(defaults(memoryLimit = None, timeoutMs = None, maxStack = None, isolated = false))]
+    #[php(defaults(memoryLimit = None, timeoutMs = None, maxStack = None, isolated = false, maxQueuedMessageBytes = None))]
     pub fn __construct(
         memoryLimit: Option<i64>,
         timeoutMs: Option<i64>,
         maxStack: Option<i64>,
         isolated: bool,
+        maxQueuedMessageBytes: Option<i64>,
     ) -> PhpResult<Self> {
+        let max_queued_message_bytes = match maxQueuedMessageBytes {
+            None => bridge::DEFAULT_MAX_QUEUED_MESSAGE_BYTES,
+            Some(limit) if limit > 0 => usize::try_from(limit).map_err(|_| {
+                PhpException::default("maxQueuedMessageBytes is too large".to_owned())
+            })?,
+            _ => {
+                return Err(PhpException::default(
+                    "maxQueuedMessageBytes must be positive".to_owned(),
+                ))
+            }
+        };
         let engine = Engine::new(
             memoryLimit.unwrap_or(0).max(0) as usize,
             timeoutMs.unwrap_or(0).max(0) as u64,
             maxStack.unwrap_or(0).max(0) as usize,
             isolated,
+            max_queued_message_bytes,
         )
         .map_err(to_php_err)?;
         Ok(QuickJS { engine })
@@ -141,6 +155,13 @@ impl QuickJS {
         }
         self.engine
             .eval_in(|ctx| self.engine.run_jobs(ctx, maxJobs))
+    }
+
+    /// Drain messages emitted with `quickjs.postMessage`. Safe to call after
+    /// an awaiting driver yields; no JS entry or Promise job is executed.
+    pub fn drainMessages(&self) -> PhpResult<Zval> {
+        let messages = marshal::MiddleValue::Array(self.engine.state.drain_messages());
+        middle_to_zval(&messages, &self.engine.state).map_err(PhpException::default)
     }
 
     /// Return the registration manifest as an array of `['name'=>..., 'types'=>...]`.
@@ -269,6 +290,7 @@ fn to_php_err<E: std::fmt::Display>(e: E) -> PhpException {
 #[php_module]
 pub fn module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        .version(env!("CARGO_PKG_VERSION"))
         // Exceptions first so subclasses can resolve their parent class entry.
         .class::<exceptions::QuickJSException>()
         .class::<exceptions::QuickJSEvalException>()

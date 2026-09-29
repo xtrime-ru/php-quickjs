@@ -11,7 +11,7 @@ use ext_php_rs::{
     types::Zval,
     zend::Function as PhpFunction,
 };
-use rquickjs::{Context, Ctx, Function, Promise, Runtime, Value};
+use rquickjs::{Context, Ctx, Function, Persistent, Promise, Runtime, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -39,6 +39,8 @@ pub struct Engine {
     /// Calls arriving from Revolt while the owner waits on a Promise are queued;
     /// the owner executes them after its Suspension resumes.
     queued_callbacks: RefCell<VecDeque<QueuedCallback>>,
+    /// Promise results of queued callbacks, kept alive across driver entries.
+    pending_callbacks: RefCell<Vec<PendingCallback>>,
     waiter: RefCell<Option<Rc<Waiter>>>,
     /// Per-entry wall-clock deadline; `None` when no eval is in flight.
     deadline: Rc<Cell<Option<Instant>>>,
@@ -51,8 +53,25 @@ pub struct Engine {
 struct QueuedCallback {
     id: u64,
     args: Vec<MiddleValue>,
+    reply: CallbackReply,
+}
+
+struct CallbackReply {
     suspension: Zval,
     result: Rc<RefCell<Option<PhpResult<Zval>>>>,
+}
+
+impl CallbackReply {
+    fn finish(self, result: PhpResult<Zval>) -> PhpResult<()> {
+        *self.result.borrow_mut() = Some(result);
+        self.suspension.try_call_method("resume", vec![])?;
+        Ok(())
+    }
+}
+
+struct PendingCallback {
+    reply: CallbackReply,
+    promise: Persistent<Promise<'static>>,
 }
 
 struct Waiter {
@@ -67,6 +86,12 @@ impl Waiter {
         }
         Ok(())
     }
+}
+
+fn wake_callback(waiter: Rc<Waiter>) -> PhpResult<Zval> {
+    let callback = Closure::wrap(Box::new(move || waiter.wake()) as Box<dyn Fn() -> PhpResult<()>>)
+        .into_zval(false)?;
+    call_php("Closure", "fromCallable", vec![&callback])
 }
 
 fn call_php(class: &str, method: &str, args: Vec<&dyn IntoZvalDyn>) -> PhpResult<Zval> {
@@ -89,7 +114,8 @@ impl Engine {
     }
 
     fn check_deadline(&self, ctx: &Ctx<'_>) -> PhpResult<()> {
-        if self.timed_out() || self.deadline.get().is_some_and(|d| Instant::now() >= d) {
+        let now = Instant::now();
+        if self.timed_out() || self.deadline.get().is_some_and(|d| now >= d) {
             self.timed_out.set(true);
             drop(ctx.catch());
             return Err(PhpException::from_class::<
@@ -129,40 +155,57 @@ impl Engine {
     }
 
     /// Await returned Promises, yielding to Revolt when host I/O is pending.
+    fn promise_for_value<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Value<'js>,
+        map_js_error: impl Fn(rquickjs::Error) -> PhpException,
+    ) -> PhpResult<Option<Promise<'js>>> {
+        match value.as_promise() {
+            Some(promise) => Ok(Some(promise.clone())),
+            None => {
+                let normalize: Function =
+                    ctx.globals().get("__asPromise").map_err(&map_js_error)?;
+                normalize.call((value,)).map_err(map_js_error)
+            }
+        }
+    }
+
     pub fn await_value<'js>(
         &self,
         ctx: &Ctx<'js>,
         value: Value<'js>,
         map_js_error: impl Fn(rquickjs::Error) -> PhpException,
     ) -> PhpResult<Value<'js>> {
-        let promise = match value.as_promise() {
-            Some(promise) => Some(promise.clone()),
-            None => {
-                let normalize: Function =
-                    ctx.globals().get("__asPromise").map_err(&map_js_error)?;
-                normalize
-                    .call::<_, Option<Promise>>((value.clone(),))
-                    .map_err(&map_js_error)?
-            }
-        };
+        let promise = self.promise_for_value(ctx, value.clone(), &map_js_error)?;
         let Some(promise) = promise else {
             return Ok(value);
         };
 
+        let mut jobs_in_quantum = 0;
         loop {
             self.check_deadline(ctx)?;
+            self.drain_queued_callbacks(ctx)?;
+            self.complete_pending_callbacks(ctx)?;
             if let Some(result) = promise.result() {
                 return result.map_err(map_js_error);
             }
             if self.run_jobs(ctx, 1)? == 0 {
-                self.suspend_on_revolt()?;
-                self.check_deadline(ctx)?;
-                self.drain_queued_callbacks(ctx)?;
+                self.suspend_on_revolt(false)?;
+                jobs_in_quantum = 0;
+            } else {
+                jobs_in_quantum += 1;
+                if jobs_in_quantum == 100 {
+                    if promise.result::<Value>().is_none() {
+                        self.suspend_on_revolt(true)?;
+                    }
+                    jobs_in_quantum = 0;
+                }
             }
         }
     }
 
-    fn suspend_on_revolt(&self) -> PhpResult<()> {
+    fn suspend_on_revolt(&self, yield_now: bool) -> PhpResult<()> {
         let suspension = call_php("Revolt\\EventLoop", "getSuspension", vec![])?;
         let waiter = Rc::new(Waiter {
             suspension: suspension.shallow_clone(),
@@ -171,20 +214,20 @@ impl Engine {
         let timer = self
             .deadline
             .get()
+            .filter(|_| !yield_now)
             .map(|deadline| -> PhpResult<Zval> {
-                let waiter = waiter.clone();
-                let callback = Closure::wrap(
-                    Box::new(move || waiter.wake()) as Box<dyn Fn() -> PhpResult<()>>
-                )
-                .into_zval(false)?;
-                let callback = call_php("Closure", "fromCallable", vec![&callback])?;
+                let callback = wake_callback(waiter.clone())?;
                 let delay = deadline
                     .saturating_duration_since(Instant::now())
                     .as_secs_f64();
                 call_php("Revolt\\EventLoop", "delay", vec![&delay, &callback])
             })
             .transpose()?;
-        *self.waiter.borrow_mut() = Some(waiter);
+        *self.waiter.borrow_mut() = Some(waiter.clone());
+        if yield_now {
+            let callback = wake_callback(waiter)?;
+            call_php("Revolt\\EventLoop", "defer", vec![&callback])?;
+        }
         let result = suspension.try_call_method("suspend", vec![]);
         self.waiter.borrow_mut().take();
         if let Some(timer) = timer {
@@ -193,15 +236,55 @@ impl Engine {
         result.map(|_| ()).map_err(Into::into)
     }
 
-    fn drain_queued_callbacks(&self, ctx: &Ctx<'_>) -> PhpResult<()> {
+    pub(crate) fn complete_pending_callbacks<'js>(&self, ctx: &Ctx<'js>) -> PhpResult<()> {
+        let mut index = 0;
+        loop {
+            let settled = {
+                let pending = self.pending_callbacks.borrow();
+                let Some(item) = pending.get(index) else {
+                    return Ok(());
+                };
+                let promise = item
+                    .promise
+                    .clone()
+                    .restore(ctx)
+                    .map_err(|e| self.callback_error(ctx, e))?;
+                promise.result()
+            };
+            if let Some(result) = settled {
+                let item = self.pending_callbacks.borrow_mut().remove(index);
+                let result = result
+                    .map_err(|e| self.callback_error(ctx, e))
+                    .and_then(|value| crate::callback::finish_callback(ctx, self, value));
+                item.reply.finish(result)?;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn drain_queued_callbacks<'js>(&self, ctx: &Ctx<'js>) -> PhpResult<()> {
         loop {
             self.check_deadline(ctx)?;
             let Some(queued) = self.queued_callbacks.borrow_mut().pop_front() else {
                 return Ok(());
             };
-            let result = crate::callback::invoke_callback(ctx, self, queued.id, &queued.args);
-            *queued.result.borrow_mut() = Some(result);
-            queued.suspension.try_call_method("resume", vec![])?;
+            let QueuedCallback { id, args, reply } = queued;
+            match crate::callback::call_js(ctx, self, id, &args) {
+                Err(error) => reply.finish(Err(error))?,
+                Ok(value) => match self
+                    .promise_for_value(ctx, value.clone(), |e| self.callback_error(ctx, e))
+                {
+                    Err(error) => reply.finish(Err(error))?,
+                    Ok(Some(promise)) => {
+                        self.pending_callbacks.borrow_mut().push(PendingCallback {
+                            reply,
+                            promise: Persistent::save(ctx, promise),
+                        })
+                    }
+                    Ok(None) => reply.finish(crate::callback::finish_callback(ctx, self, value))?,
+                },
+            }
         }
     }
 
@@ -225,8 +308,10 @@ impl Engine {
             .push_back(QueuedCallback {
                 id,
                 args,
-                suspension: suspension.shallow_clone(),
-                result: result.clone(),
+                reply: CallbackReply {
+                    suspension: suspension.shallow_clone(),
+                    result: result.clone(),
+                },
             });
         waiter.wake()?;
         suspension.try_call_method("suspend", vec![])?;
@@ -241,6 +326,7 @@ impl Engine {
         timeout_ms: u64,
         max_stack: usize,
         isolated: bool,
+        max_queued_message_bytes: usize,
     ) -> rquickjs::Result<Rc<Self>> {
         let rt = Runtime::new()?;
         sandbox::apply_limits(&rt, memory_limit, max_stack);
@@ -255,7 +341,7 @@ impl Engine {
         } else {
             Some(Context::full(&rt)?)
         };
-        let state = BridgeState::new();
+        let state = BridgeState::new(max_queued_message_bytes);
         let engine = Rc::new(Engine {
             rt,
             state: state.clone(),
@@ -265,6 +351,7 @@ impl Engine {
             active_ctx: Cell::new(None),
             active_fiber: Cell::new(None),
             queued_callbacks: RefCell::new(VecDeque::new()),
+            pending_callbacks: RefCell::new(Vec::new()),
             waiter: RefCell::new(None),
             deadline,
             timed_out,
@@ -316,6 +403,7 @@ impl Engine {
             let ctx = unsafe { Ctx::from_raw(ptr) };
             self.check_deadline(&ctx)?;
             let result = f(&ctx);
+            self.complete_pending_callbacks(&ctx)?;
             self.check_deadline(&ctx)?;
             return result;
         }
@@ -334,6 +422,7 @@ impl Engine {
                     .map_err(|e| self.callback_error(&c, e))?;
                 self.check_deadline(&c)?;
                 let result = f(&c);
+                self.complete_pending_callbacks(&c)?;
                 self.check_deadline(&c)?;
                 result
             })
@@ -398,10 +487,23 @@ impl Drop for ExecutionGuard<'_> {
         self.engine.disarm_deadline();
         let pending = std::mem::take(&mut *self.engine.queued_callbacks.borrow_mut());
         for queued in pending {
-            *queued.result.borrow_mut() = Some(Err(PhpException::default(
+            let _ = queued.reply.finish(Err(PhpException::default(
                 "JavaScript callback canceled: owning call ended".to_owned(),
             )));
-            let _ = queued.suspension.try_call_method("resume", vec![]);
         }
+        if self.engine.shared_ctx.is_none() {
+            let pending = std::mem::take(&mut *self.engine.pending_callbacks.borrow_mut());
+            for item in pending {
+                let _ = item.reply.finish(Err(PhpException::default(
+                    "JavaScript callback canceled: isolated realm ended".to_owned(),
+                )));
+            }
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.pending_callbacks.get_mut().clear();
     }
 }

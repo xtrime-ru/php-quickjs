@@ -5,7 +5,7 @@
 ```
 ┌─ PHP (trusted, full Zend) ──┐   ┌─ Rust extension ─┐   ┌─ QuickJS (untrusted) ─┐
 │ $js->register(...)          │   │  owns the engine  │   │  php.module.fn()       │
-│ $js->eval(tsCode)           │◄─►│  ONE __host import│◄─►│  frozen php.* facade   │
+│ $js->eval(tsCode)           │◄─►│  host capabilities│◄─►│  frozen php.* facade   │
 │ $js->grant($obj)            │   │  msgpack marshal  │   │  guest TS-as-JS        │
 └─────────────────────────────┘   └───────────────────┘   └────────────────────────┘
         ext-php-rs (zval ↔ Rust)        rquickjs (Rust ↔ JSValue)
@@ -15,8 +15,9 @@ It is **one process, one thread**. The Rust extension is a `cdylib` that PHP
 loads natively; `QuickJS`, `Js\Callback`, and the `QuickJS*Exception` classes are
 real PHP classes implemented in Rust.
 
-The design has a single key principle: **the namespacing is cosmetic; the trust
-boundary is a flat dispatch table reached through one host import.**
+The capability trust boundary is a flat dispatch table reached through
+`__host`. `quickjs.postMessage()` is a separate data-only output sink with a
+bounded native queue.
 
 ## How one call flows, end to end
 
@@ -40,8 +41,8 @@ Take `php.math.add(2, 3)` from a guest script.
 3. `__rt.callHost` (`src/js/runtime.js`) **msgpack-encodes** the argument array
    and calls `__host("math.add", bytes)`.
 
-4. `__host` is the **single** native function Rust injects into the realm — the
-   entire JS→host entry point. In `bridge.rs` it:
+4. `__host` is the native entry point for registered PHP capabilities. In
+   `bridge.rs` it:
    - decodes the msgpack payload to a `MiddleValue` list,
    - looks `"math.add"` up in the **dispatch table** (rejects if not registered —
      this is the trust boundary),
@@ -51,9 +52,9 @@ Take `php.math.add(2, 3)` from a guest script.
 5. The result travels back `zval → MiddleValue → msgpack bytes`, and `__rt`
    decodes it in the realm. `5` lands in the guest.
 
-Adding a capability never changes this ABI — there is exactly one import and one
-dispatch table. The flat, dotted-name list (`manifest()`) is the complete audit
-surface.
+Adding a capability never changes this ABI: all registered capabilities use
+one dispatch table. The flat, dotted-name list (`manifest()`) is the complete
+audit surface for PHP callables.
 
 ### The facade is generated, and frozen
 
