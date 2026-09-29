@@ -25,14 +25,15 @@ $otherCallback = $other->eval('(n) => n + 100');
 $js->register('other', fn($n) => $otherCallback($n));
 eq(107, $js->eval('php.other(7)'), 'cross-engine callback uses its own context');
 
-$js->register('suspend', fn() => Fiber::suspend());
+$js->register('suspendValue', fn() => Fiber::suspend('inside JS'));
 $suspending = new Fiber(function () use ($js) {
-    throws(fn() => $js->eval('php.suspend()'), Throwable::class, 'switching inside active JS is rejected');
-    Fiber::suspend('outside');
+    eq(42, $js->eval('php.suspendValue(); 42'), 'host callback resumes on its owning Fiber');
 });
-eq('outside', $suspending->start(), 'switching is restored after returning from JS');
+eq('inside JS', $suspending->start(), 'host callback may suspend like php-tokio');
+throws(fn() => $js->eval('1'), Throwable::class, 'another Fiber cannot enter a suspended engine');
 $suspending->resume();
-eq(3, $js->eval('1 + 2'), 'engine remains usable after rejected switch');
+eq(true, $suspending->isTerminated(), 'owning Fiber finishes after resumption');
+eq(3, $js->eval('1 + 2'), 'engine remains usable after Fiber resumption');
 
 $js->register('apply', fn($fn) => $fn());
 (new Fiber(function () use ($js) {

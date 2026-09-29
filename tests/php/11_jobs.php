@@ -4,6 +4,26 @@ require __DIR__ . '/_harness.php';
 $js = new QuickJS();
 eq(false, $js->hasPendingJobs(), 'new runtime has no jobs');
 eq(0, $js->executePendingJobs(), 'empty queue returns immediately');
+
+eq(42, $js->eval('(async () => 42)()'), 'fulfilled async eval is awaited automatically');
+eq(42, $js->eval('(async () => { await 0; return 42; })()'), 'async eval drains its own jobs');
+$asyncDouble = $js->eval('async n => { await 0; return n * 2; }');
+eq(42, $asyncDouble(21), 'async JS callback returns its fulfilled value to PHP');
+throws(
+    fn() => $js->eval('(async () => { await 0; throw new Error("async boom"); })()'),
+    QuickJSEvalException::class,
+    'async rejection becomes a PHP evaluation exception'
+);
+eq(42, $js->eval('({ then(resolve) { resolve(42); } })'), 'thenables are awaited');
+eq(42, $js->eval('({ get then() { if (this.read) throw new Error("then read twice"); this.read = true; return resolve => resolve(42); } })'), 'thenable getter is read once');
+eq(42, (new QuickJS(isolated: true))->eval('(async () => { await 0; return 42; })()'), 'isolated eval awaits its Promise');
+$stop = new QuickJS();
+eq(42, $stop->eval('globalThis.detached = 0; Promise.resolve().then(() => { Promise.resolve().then(() => { detached = 1; }); return 42; })'), 'await stops when its Promise settles');
+eq(0, $stop->eval('detached'), 'await leaves later detached jobs queued');
+$stop->executePendingJobs();
+eq(1, $stop->eval('detached'), 'detached jobs can still be drained explicitly');
+throws(fn() => (new QuickJS())->eval('new Promise(() => {})'), Throwable::class, 'external wait without autoloaded Revolt fails clearly');
+
 $js->eval('globalThis.answer = 0; Promise.resolve(21).then(n => { answer = n * 2; }); void 0;');
 eq(0, $js->eval('answer'), 'eval does not implicitly drain jobs');
 eq(true, $js->hasPendingJobs(), 'Promise reaction is pending');

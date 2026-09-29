@@ -18,7 +18,7 @@ surfaced by `dts()`. This flat registry is the **entire** trust boundary.
 
 ### `eval(string $code): mixed`
 
-Run TypeScript or JavaScript and marshal the result back to PHP. Errors raise a
+Run TypeScript or JavaScript, await a returned Promise, and marshal its result to PHP. Errors raise a
 `QuickJSEvalException` located at the original TS line/column (see [errors](errors.md)).
 
 ### `grant(mixed $resource): int` / `resolve(int $h): mixed` / `revoke(int $h): bool`
@@ -59,7 +59,9 @@ budget. The constructor's `timeoutMs` also applies to this call, including an
 individual job that does not return; a timeout raises `QuickJSTimeoutException`.
 
 Only shared mode supports job pumping. Calling `executePendingJobs()` from an active JS
-call is rejected. `eval()` and `Js\Callback` do not drain jobs implicitly.
+call is rejected. `eval()` and `Js\Callback` automatically await a Promise they
+return, including the jobs needed to settle it. They do not drain unrelated,
+detached jobs when their own result is not a Promise.
 Promise rejections retain JavaScript semantics: use `.catch()`/rejection handlers;
 `executePendingJobs()` is not an unhandled-rejection reporting API.
 

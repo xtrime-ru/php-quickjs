@@ -29,7 +29,7 @@ class QuickJS
      */
     public function register(string $name, callable $callable, ?string $types = null): void {}
 
-    /** Evaluate JS source and marshal the result back to a PHP value. */
+    /** Evaluate JS source and marshal the result back to PHP, awaiting a returned Promise. */
     public function eval(string $code): mixed {}
 
     /** The registration manifest: a list of `['name' => string, 'types' => ?string]`. */
@@ -70,7 +70,10 @@ namespace Js {
          * @return array{messages: list<array{string, mixed}>, jobs: int, pending: bool}
          */
         public function dispatch(?array $args, int $maxJobs = 100): array {}
+        /** Invoke the JS function, awaiting a returned Promise. */
         public function __invoke(mixed ...$args): mixed {}
+
+        /** Invoke the JS function, awaiting a returned Promise. */
         public function call(mixed ...$args): mixed {}
     }
 }

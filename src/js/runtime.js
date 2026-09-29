@@ -90,16 +90,13 @@ if (!globalThis.__rt) {
     return unwrap(mp.decode(globalThis.__php_invoke(id, mp.encode(wrap(args)))));
   }
 
-  // host -> JS: invoke a JS function previously handed to PHP (called by Rust).
-  function invokeJs(id, argsBytes) {
-    var fn = jsFns[id];
-    if (!fn) throw new Error("unknown JS callback id " + id);
-    var args = unwrap(mp.decode(argsBytes));
-    var r = fn.apply(null, args);
-    return mp.encode(wrap(r));
+  // Normalize thenables; Rust reads settlement through QuickJS's Promise API.
+  function asPromise(value) {
+    return value !== null &&
+      (typeof value === "object" || typeof value === "function")
+      ? Promise.resolve(value) : null;
   }
 
-  globalThis.__invokeJs = invokeJs;
   // Used by the host to register a bare JS function value (e.g. an eval result
   // that is a function) so it can be handed to PHP as a Js\Callback.
   globalThis.__registerJsFn = registerFn;
@@ -110,6 +107,7 @@ if (!globalThis.__rt) {
   // Called when a PHP-side Js\Callback is garbage-collected, to release its
   // entry from the registry.
   globalThis.__deleteJsFn = deleteFn;
+  globalThis.__asPromise = asPromise;
   // Test/diagnostic helper: number of live JS callbacks held for PHP.
   globalThis.__jsFnCount = function () {
     return Object.keys(jsFns).length;
@@ -123,7 +121,6 @@ if (!globalThis.__rt) {
     unwrap: unwrap,
     callHost: callHost,
     callPhp: callPhp,
-    invokeJs: invokeJs,
   };
   })();
 }

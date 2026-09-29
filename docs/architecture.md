@@ -109,14 +109,14 @@ the real callable is held in a registry on the owning side.
   **JS-side** registry (`jsFns` in `runtime.js`); PHP receives a `Js\Callback`
   object holding the integer `id`.
 
-`runtime.js` does the wrapping: `wrap()` replaces functions with refs before
-encoding (outgoing), `unwrap()` replaces refs with callables after decoding
-(incoming). The host (Rust) only ever sees the tagged refs.
+For JS → PHP calls, `wrap()` replaces functions with refs before encoding and
+`unwrap()` restores them after decoding. Saved JS callbacks use native value
+conversion in Rust.
 
 ### Invoking a JS function from PHP
 
-`Js\Callback::__invoke` (`callback.rs`) re-enters the realm and calls
-`globalThis.__invokeJs(id, argsBytes)`, which looks up `jsFns[id]` and runs it.
+`Js\Callback::__invoke` (`callback.rs`) looks up the function with `__getJsFn`,
+converts its arguments, invokes it, and awaits any returned Promise.
 
 The subtlety is **re-entrancy**. Each engine records its own active context
 while inside `Context::with`. A nested callback reuses that context instead of
@@ -125,9 +125,12 @@ own context. The active pointer is cleared by a scope guard on return, including
 errors. A re-entrancy depth cap (200) bounds recursive bridge calls.
 
 At an outer entry, QuickJS's stack limit is refreshed for the current PHP Fiber.
-Zend Fiber switching is blocked while native borrows are live. The same guard
-arms and clears the execution deadline for evals, callbacks, and job batches.
-See [asynchronous execution](async.md).
+The engine records that Fiber as its owner. Like php-tokio, a host callback may
+suspend while its native Rust/QuickJS stack remains alive, but another Fiber may
+not enter the same engine. External Promise callbacks are queued by Revolt and
+executed after the owner resumes. The same entry guard arms and clears the
+execution deadline for evals, callbacks, and job batches. See
+[asynchronous execution](async.md).
 
 ## Capability handles
 

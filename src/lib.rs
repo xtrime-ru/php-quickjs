@@ -108,6 +108,7 @@ impl QuickJS {
             let value: rquickjs::Value = ctx
                 .eval_with_options(module.js.as_bytes(), opts)
                 .map_err(&eval_err)?;
+            let value = self.engine.await_value(ctx, value, eval_err)?;
             let middle = js_to_middle(ctx, value, &state).map_err(&eval_err)?;
             middle_to_zval(&middle, &state).map_err(PhpException::default)
         })
@@ -124,8 +125,7 @@ impl QuickJS {
         })
     }
 
-    /// Execute at most maxJobs ready jobs; never waits for host I/O. Jobs are
-    /// explicit, so eval/callback execution keeps its synchronous behavior.
+    /// Execute at most maxJobs ready jobs without waiting for host I/O.
     #[php(defaults(maxJobs = 100))]
     pub fn executePendingJobs(&self, maxJobs: i64) -> PhpResult<i64> {
         self.require_shared_jobs()?;

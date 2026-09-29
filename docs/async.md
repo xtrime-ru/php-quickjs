@@ -1,9 +1,22 @@
-# Promise jobs and PHP Fibers
+# Async functions, Promise jobs and PHP Fibers
 
-QuickJS provides Promises, but the host owns I/O and scheduling. The extension
-exposes `hasPendingJobs()` and `executePendingJobs($maxJobs = 100)` so a PHP event loop can
-advance JavaScript without blocking on network activity. No event loop library
-is required by the extension.
+`eval()` and `Js\Callback` automatically await returned Promises and thenables:
+
+```php
+$double = $js->eval('async n => { await 0; return n * 2; }');
+echo $double(21); // 42
+echo $js->eval('(async () => 42)()'); // 42
+```
+
+Rejections become PHP exceptions. For external I/O, install and autoload
+`revolt/event-loop`. The current flow yields through `EventLoop::getSuspension()`;
+`timeoutMs` wakes it if the Promise does not settle in time. Like php-tokio,
+registered PHP callbacks may await I/O while the native stack remains suspended.
+
+## Detached low-level jobs
+
+For detached work whose Promise is not returned to PHP, use `hasPendingJobs()`
+and `executePendingJobs($maxJobs = 100)`. This manual mode needs no event loop.
 
 ```php
 $js = new QuickJS(timeoutMs: 100);
@@ -17,36 +30,21 @@ $resolve(42);
 $js->executePendingJobs(); // prints 42
 ```
 
-Keep the instance in shared mode (`isolated: false`, the default). `executePendingJobs()`
-and `hasPendingJobs()` reject isolated mode, whose contexts do not survive their
-eval boundary. A Promise waiting for I/O will not keep `hasPendingJobs()` true.
-
-For an event loop, execute a bounded batch after delivering I/O results. If jobs
-remain, schedule another batch on a later loop turn. Do not busy-wait on pending
-Promises, and do not drain an unbounded self-scheduling queue before servicing
-I/O. Resolve an application-level PHP Future from a registered completion
-callback; PHP Futures are not converted to JS Promises automatically.
+Manual jobs require shared mode (`isolated: false`). `hasPendingJobs()` counts
+ready jobs, not pending I/O. Run bounded batches after I/O; never busy-wait.
+Automatic awaiting stops when the returned Promise settles, leaving later jobs
+queued. PHP Future objects are not automatically converted to JS Promises.
 
 ## Fiber boundaries
 
-An instance or saved callback may be used sequentially from different PHP
-Fibers. At each outer JS entry the extension refreshes QuickJS's native stack
-limit. Nested callbacks reuse the owning engine's context and retain the outer
-execution deadline. Saved callbacks and job batches obey `timeoutMs` too.
+Each active engine belongs to one PHP Fiber. While it awaits a Promise, saved
+callbacks from other Revolt Fibers are queued for the owner; their callers wait
+for the result or exception. Other concurrent entry is rejected. Sequential use
+from different Fibers is supported; the extension remains single-threaded/NTS.
 
-PHP must return from the extension before switching Fibers. Switching while JS
-is active is rejected by Zend: a suspended Rust/QuickJS stack would keep live
-borrows and a runtime lock. Register callbacks that enqueue work and return;
-perform asynchronous I/O after control returns to PHP. This also applies to
-starting another Fiber synchronously from a host callback.
-
-Synchronous JS → PHP → JS callbacks remain supported, including callbacks owned
-by a different QuickJS instance. Calling `eval()` or `executePendingJobs()` reentrantly on
-the active instance is rejected; use a saved JS callback for synchronous reentry.
-
-The execution deadline interrupts JavaScript, not blocking PHP/C code in a host
-callback. An overrun throws when PHP returns to the extension. Keep host callbacks short. The extension remains single-threaded/NTS;
-Fiber support does not add ZTS or parallel-thread support.
+Nested JS → PHP → JS calls reuse the owner's context and deadline. Reentrant
+`eval()` and job pumping are rejected; use a saved callback instead.
+Blocking PHP/C callbacks cannot be interrupted: an overrun throws on return.
 
 ## Batched direct dispatch
 

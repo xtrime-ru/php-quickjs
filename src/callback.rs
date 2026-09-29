@@ -7,11 +7,11 @@
 
 use crate::engine::Engine;
 use crate::marshal::{
-    arguments_to_middle, data_arguments, middle_to_js, middle_to_zval, MiddleValue,
+    arguments_to_middle, data_arguments, js_to_middle, middle_to_js, middle_to_zval, MiddleValue,
 };
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendHashTable, Zval};
-use rquickjs::{Ctx, Function, TypedArray, Value};
+use rquickjs::{Ctx, Function, Value};
 use std::rc::Rc;
 
 #[php_class]
@@ -45,33 +45,15 @@ impl JsCallback {
 
         let middle_args =
             arguments_to_middle(args, &self.engine.state).map_err(PhpException::default)?;
-        let payload = MiddleValue::Array(middle_args)
-            .to_msgpack()
-            .map_err(|e| PhpException::default(e.to_string()))?;
         let id = self.id;
         let engine = self.engine.clone();
 
+        if self.engine.active_on_other_fiber()? {
+            return self.engine.queue_callback(id, middle_args);
+        }
+
         let run = move |ctx: &Ctx<'_>| -> PhpResult<Zval> {
-            let globals = ctx.globals();
-            let invoke: Function = globals
-                .get("__invokeJs")
-                .map_err(|e| PhpException::default(format!("__invokeJs missing: {e}")))?;
-            let arg_bytes = TypedArray::new(ctx.clone(), payload.clone())
-                .map_err(|e| PhpException::default(e.to_string()))?;
-            // A JS error here re-surfaces a host exception (unwrapped to its
-            // original PHP class) or becomes a QuickJSEvalException.
-            let ret: Value = invoke
-                .call((id as f64, arg_bytes))
-                .map_err(|e| engine.callback_error(ctx, e))?;
-            let ta = TypedArray::<u8>::from_value(ret).map_err(|e| {
-                PhpException::default(format!("JS callback did not return bytes: {e}"))
-            })?;
-            let bytes = ta
-                .as_bytes()
-                .ok_or_else(|| PhpException::default("detached result buffer".to_owned()))?;
-            let mv = MiddleValue::from_msgpack(bytes)
-                .map_err(|e| PhpException::default(e.to_string()))?;
-            middle_to_zval(&mv, &engine.state).map_err(PhpException::default)
+            invoke_callback(ctx, &engine, id, &middle_args)
         };
 
         if !self.engine.is_active() && self.engine.shared_ctx().is_none() {
@@ -81,6 +63,37 @@ impl JsCallback {
         }
         self.engine.eval_in(run)
     }
+}
+
+pub(crate) fn invoke_callback(
+    ctx: &Ctx<'_>,
+    engine: &Engine,
+    id: u64,
+    args: &[MiddleValue],
+) -> PhpResult<Zval> {
+    let map_error = |e| engine.callback_error(ctx, e);
+    let value = call_js(ctx, engine, id, args)?;
+    let value = engine.await_value(ctx, value, map_error)?;
+    let middle = js_to_middle(ctx, value, &engine.state).map_err(map_error)?;
+    middle_to_zval(&middle, &engine.state).map_err(PhpException::default)
+}
+
+fn call_js<'js>(
+    ctx: &Ctx<'js>,
+    engine: &Engine,
+    id: u64,
+    args: &[MiddleValue],
+) -> PhpResult<Value<'js>> {
+    let map_error = |e| engine.callback_error(ctx, e);
+    let get: Function = ctx.globals().get("__getJsFn").map_err(&map_error)?;
+    let function: Function = get.call((id as f64,)).map_err(&map_error)?;
+    let mut call_args = rquickjs::function::Args::new(ctx.clone(), args.len());
+    for arg in args {
+        call_args
+            .push_arg(middle_to_js(ctx, arg, &engine.state).map_err(&map_error)?)
+            .map_err(&map_error)?;
+    }
+    function.call_arg(call_args).map_err(map_error)
 }
 
 #[php_impl]
@@ -113,25 +126,8 @@ impl JsCallback {
         let _batch = self.engine.state.begin_batch();
         self.engine.eval_in(|ctx| {
             if let Some(MiddleValue::Array(items)) = &middle {
-                let get: Function = ctx
-                    .globals()
-                    .get("__getJsFn")
-                    .map_err(|e| self.engine.callback_error(ctx, e))?;
-                let fun: Function = get
-                    .call((self.id as f64,))
-                    .map_err(|e| self.engine.callback_error(ctx, e))?;
-                let mut call_args = rquickjs::function::Args::new(ctx.clone(), items.len());
-                for item in items {
-                    call_args
-                        .push_arg(
-                            middle_to_js(ctx, item, &self.engine.state)
-                                .map_err(|e| self.engine.callback_error(ctx, e))?,
-                        )
-                        .map_err(|e| self.engine.callback_error(ctx, e))?;
-                }
                 // Dispatch is a notification; its return value is deliberately ignored.
-                fun.call_arg::<Value>(call_args)
-                    .map_err(|e| self.engine.callback_error(ctx, e))?;
+                call_js(ctx, &self.engine, self.id, items)?;
             }
             let jobs = self.engine.run_jobs(ctx, maxJobs)?;
             let pending = unsafe {

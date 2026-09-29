@@ -114,18 +114,19 @@ PHP (trusted)  ──ext-php-rs──►  Rust bridge  ──rquickjs──►  
 ```
 
 Everything the guest reaches goes through a single `__host` import and a flat dispatch
-table; the namespaced `php.*` tree is frozen JS built from your registrations. Values
-cross as MessagePack, functions as references backed by registries, and errors bridge
+table; the namespaced `php.*` tree is frozen JS built from your registrations. Host
+calls use MessagePack; eval and saved callbacks use native conversion. Functions
+cross as registry references, and errors bridge
 both ways — remapping to TS coordinates on the way out.
 
 → **[docs/architecture.md](docs/architecture.md)** for the full design.
 
 ## Asynchronous execution
 
-Use `executePendingJobs()` to advance Promise continuations in bounded batches and
-`hasPendingJobs()` to check for ready work. The host owns timers and I/O.
-Instances may be used sequentially from PHP Fibers, but host callbacks must
-return before switching Fibers. See [Promise jobs and Fibers](docs/async.md).
+`eval()` and `Js\Callback` automatically await returned Promises. External I/O
+yields through Revolt using php-tokio's Fiber model; rejections become PHP
+exceptions. Manual job APIs remain available for detached work. See
+[asynchronous execution](docs/async.md).
 
 ## Scope
 
