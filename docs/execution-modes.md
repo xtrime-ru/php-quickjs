@@ -14,10 +14,11 @@ See [`examples/modes.php`](../examples/modes.php) for the two side by side.
 
 A QuickJS **`Context`** is a *realm*: its own `globalThis`, its own intrinsics
 (`Array`, `JSON`, …), and its own top-level scope. The **`Runtime`** (heap, GC,
-memory limit, interrupt handler) is separate and owned once per `QuickJS`
-instance (`engine.rs`).
+memory limit, interrupt handler, and Promise job queue) is separate. Shared mode
+keeps one runtime per instance; isolated mode creates and drops a runtime for each
+outer `eval()`. Nested callbacks reuse the active runtime.
 
-The only difference between the modes is **realm lifecycle**:
+The modes differ in **runtime and realm lifecycle**:
 
 | | Shared (default) | Isolated (`isolated: true`) |
 |---|---|---|
@@ -29,7 +30,8 @@ The only difference between the modes is **realm lifecycle**:
 | Capability handles | work | work |
 | Synchronous callbacks (within an eval) | work | work |
 | JS callback stored in PHP, called later | works | **throws** (realm gone) |
-| Memory limit | shared across evals | shared across evals (same `Runtime`) |
+| Memory limit | shared across evals | applied separately to each eval |
+| Detached Promise jobs | remain queued | discarded when eval ends |
 
 ## Shared mode — a persistent session
 
@@ -55,7 +57,8 @@ on `globalThis` for the next eval to read.
 
 ## Isolated mode — a stateless runner
 
-A fresh realm per `eval()`, discarded afterward. Think **independent script
+A fresh runtime and realm per `eval()`, discarded afterward. A returned Promise
+is awaited; any remaining detached jobs are discarded without being executed. Think **independent script
 runner**: every eval is hermetic.
 
 ```php
@@ -87,7 +90,8 @@ The behavioral split comes down to **what lives in the realm vs. host-side**:
   modes behave identically there.
 - Guest globals and the **JS function registry** (`jsFns`, in `runtime.js`) live
   **in the realm** → shared mode keeps them, isolated mode drops them with the
-  realm. That single fact is the entire difference.
+  realm. Detached Promise jobs live in the runtime, which isolated mode also
+  discards.
 
 ## The JS callback registry: persistence and cleanup
 
@@ -123,5 +127,5 @@ registry is reclaimed shortly after PHP lets go. In isolated mode the whole real
   no collisions, automatic per-eval cleanup). Caveat: don't stash a JS callback in
   PHP to fire after the eval — pass it and use it *within* the eval.
 - **Strongest isolation:** a brand-new `QuickJS` per tenant. That gives a fresh
-  `Runtime` too — a separate heap and its own memory limit — not just a fresh
-  realm.
+  host-side capability registrations and handles too. Isolated mode already
+  gives each eval a separate heap and memory limit.

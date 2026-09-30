@@ -34,6 +34,13 @@ throws(
     'alloc bomb trips the memory limit'
 );
 
+$isolatedMem = new QuickJS(memoryLimit: 2 * 1024 * 1024, isolated: true);
+for ($i = 0; $i < 2; ++$i) {
+    throws(fn() => $isolatedMem->eval('let a = []; while (true) { a.push(new Array(100000).fill(0)); }'),
+        QuickJSMemoryException::class, 'fresh isolated runtime enforces its memory limit');
+    eq(42, $isolatedMem->eval('42'), 'isolated runtime recovers after memory exhaustion');
+}
+
 // --- Unbounded by default ------------------------------------------------
 $free = new QuickJS();
 eq(500500, $free->eval('let s=0; for (let i=0;i<=1000;i++) s+=i; s'), 'no limits by default');

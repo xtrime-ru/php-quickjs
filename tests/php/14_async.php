@@ -94,4 +94,18 @@ $limited->register('cancel', static function ($callback) use (&$future): void {
 throws(fn() => Amp\async(fn() => $limited->eval('new Promise(() => php.cancel(() => { globalThis.late = true; return 42; }))'))->await(), QuickJSTimeoutException::class, 'expired owner does not execute queued callbacks');
 throws(fn() => $future->await(), Exception::class, 'canceled callback wakes its caller with an exception');
 eq('undefined', $limited->eval('typeof late'), 'canceled callback has no side effects');
+// Isolated entries still receive external callbacks, but pending callback
+// Promises must release their Persistent handles before their runtime is freed.
+$isolated = new QuickJS(isolated: true, timeoutMs: 1000);
+$isolated->register('later', static function ($resolve): void {
+    Revolt\EventLoop::delay(0.001, static fn() => $resolve(42));
+});
+eq(42, Amp\async(fn() => $isolated->eval('new Promise(resolve => php.later(resolve))'))->await(), 'isolated eval awaits external resolution');
+$isolated->register('startPending', static function ($callback, $resolve) use (&$future): void {
+    $future = Amp\async(static fn() => $callback());
+    Revolt\EventLoop::defer(static fn() => $resolve(8));
+});
+eq(8, $isolated->eval('new Promise(resolve => php.startPending(() => new Promise(() => {}), resolve))'), 'isolated owner finishes with a callback Promise pending');
+throws(fn() => $future->await(), Exception::class, 'isolated entry cancels and releases pending callback');
+eq(42, $isolated->eval('(async () => { await 0; return 42; })()'), 'new isolated runtime works after pending callback cleanup');
 done();

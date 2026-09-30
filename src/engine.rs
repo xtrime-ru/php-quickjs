@@ -26,6 +26,10 @@ pub const MAX_DEPTH: usize = 200;
 pub struct Engine {
     pub rt: Runtime,
     pub state: Rc<BridgeState>,
+    memory_limit: usize,
+    max_stack: usize,
+    /// Monotonic identity of an isolated entry; shared mode keeps zero.
+    realm_id: Cell<u64>,
     /// Content-addressed TS->JS transpile cache (source maps kept host-side).
     pub transpile: TranspileCache,
     /// The persistent realm in shared mode; `None` in isolated mode (a fresh
@@ -345,6 +349,9 @@ impl Engine {
         let engine = Rc::new(Engine {
             rt,
             state: state.clone(),
+            memory_limit,
+            max_stack,
+            realm_id: Cell::new(0),
             transpile: TranspileCache::new(256),
             shared_ctx,
             depth: Cell::new(0),
@@ -382,6 +389,10 @@ impl Engine {
     /// The persistent realm, if this engine has one (shared mode).
     pub fn shared_ctx(&self) -> Option<&Context> {
         self.shared_ctx.as_ref()
+    }
+
+    pub fn realm_id(&self) -> u64 {
+        self.realm_id.get()
     }
 
     pub fn is_active(&self) -> bool {
@@ -430,8 +441,13 @@ impl Engine {
         match &self.shared_ctx {
             Some(ctx) => run(ctx),
             None => {
-                let ctx =
-                    Context::full(&self.rt).map_err(|e| PhpException::default(e.to_string()))?;
+                // Pending jobs belong to the runtime, not the context. Drop
+                // both at entry completion so detached jobs cannot escape.
+                let rt = Runtime::new().map_err(|e| PhpException::default(e.to_string()))?;
+                sandbox::apply_limits(&rt, self.memory_limit, self.max_stack);
+                sandbox::install_interrupt(&rt, self.deadline.clone(), self.timed_out.clone());
+                let ctx = Context::full(&rt).map_err(|e| PhpException::default(e.to_string()))?;
+                self.realm_id.set(self.realm_id.get() + 1);
                 run(&ctx)
             }
         }

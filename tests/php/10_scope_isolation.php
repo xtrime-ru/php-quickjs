@@ -59,4 +59,14 @@ $iso->register('keep', function ($cb) use (&$held) {
 $iso->eval('php.keep(() => 1)');
 throws(fn() => $held(), \Throwable::class, 'stored callback rejected after its eval (isolated)');
 
+// Old ids must not resolve or delete a function in a later isolated realm.
+$iso->register('tryOld', function () use (&$held) {
+    throws(fn() => $held(), Throwable::class, 'old callback rejected inside a later eval');
+    $held = null;
+});
+eq(42, $iso->eval('php.apply(n => { php.tryOld(); return n * 7; }, 6)'), 'dropping old callback preserves the current callback');
+$old = $iso->eval('() => 1');
+throws(fn() => $iso->roundtrip($old), Throwable::class, 'ended callback cannot be round-tripped into a fresh realm');
+$iso->register('returnOld', fn() => $old);
+throws(fn() => $iso->eval('php.returnOld()'), Throwable::class, 'old callback cannot be marshaled into a new realm');
 done();

@@ -317,6 +317,7 @@ impl<'a> PhpConversion<'a> {
             if !std::rc::Rc::ptr_eq(&owner, &cb.engine) {
                 return Err("JS callback belongs to a different QuickJS instance".to_owned());
             }
+            cb.check_realm()?;
             return Ok(MiddleValue::JsFn(cb.id));
         }
         if zv.is_callable() {

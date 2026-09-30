@@ -18,12 +18,26 @@ use std::rc::Rc;
 #[php(name = "Js\\Callback")]
 pub struct JsCallback {
     pub id: u64,
+    realm_id: u64,
     pub engine: Rc<Engine>,
 }
 
 impl JsCallback {
     pub fn new(id: u64, engine: Rc<Engine>) -> Self {
-        JsCallback { id, engine }
+        JsCallback {
+            id,
+            realm_id: engine.realm_id(),
+            engine,
+        }
+    }
+
+    pub fn check_realm(&self) -> Result<(), String> {
+        if self.realm_id != self.engine.realm_id()
+            || (self.engine.shared_ctx().is_none() && !self.engine.is_active())
+        {
+            return Err("JS callback belongs to an ended isolated eval".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -34,13 +48,16 @@ impl Drop for JsCallback {
     /// wrapper while JS still needs the entry, so deleting eagerly would race.
     /// Queuing touches no JS and cannot re-enter the engine.
     fn drop(&mut self) {
-        self.engine.state.queue_fn_deletion(self.id);
+        if self.check_realm().is_ok() {
+            self.engine.state.queue_fn_deletion(self.id);
+        }
     }
 }
 
 impl JsCallback {
     /// Invoke the underlying JS function with the given (already PHP-side) args.
     fn invoke_inner(&self, args: &[&Zval]) -> PhpResult<Zval> {
+        self.check_realm().map_err(PhpException::default)?;
         let _guard = self.engine.enter().map_err(PhpException::default)?;
 
         let middle_args =
