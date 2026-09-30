@@ -130,22 +130,62 @@ impl CompilerInterface for TsCompiler {
 // content-addressed cache
 // ---------------------------------------------------------------------------
 
+const CACHE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+
 struct CachedModule {
     source: String,
     transpiled: Transpiled,
 }
 
+impl CachedModule {
+    fn byte_len(&self) -> usize {
+        self.source.len()
+            + self.transpiled.js.len()
+            + self.transpiled.map_json.as_ref().map_or(0, |map| map.len())
+    }
+}
+
+struct CacheState {
+    entries: LruCache<u64, CachedModule>,
+    bytes: usize,
+}
+
+impl CacheState {
+    fn insert(&mut self, key: u64, module: CachedModule, budget: usize) {
+        let bytes = module.byte_len();
+        // Large guests still execute, without evicting useful cached modules.
+        if bytes > budget {
+            return;
+        }
+        if let Some(previous) = self.entries.pop(&key) {
+            self.bytes -= previous.byte_len();
+        }
+        while self.bytes + bytes > budget || self.entries.len() == self.entries.cap().get() {
+            if let Some((_, oldest)) = self.entries.pop_lru() {
+                self.bytes -= oldest.byte_len();
+            } else {
+                break;
+            }
+        }
+        self.entries.put(key, module);
+        self.bytes += bytes;
+    }
+}
+
 /// A small LRU mapping `hash(source)` -> transpiled output. Single-threaded
 /// (PHP NTS), so a `RefCell` is sufficient.
 pub struct TranspileCache {
-    inner: RefCell<LruCache<u64, CachedModule>>,
+    inner: RefCell<CacheState>,
 }
 
 impl TranspileCache {
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         TranspileCache {
-            inner: RefCell::new(LruCache::new(cap)),
+            inner: RefCell::new(CacheState {
+                entries: LruCache::new(cap),
+                bytes: 0,
+            }),
         }
     }
 
@@ -154,7 +194,7 @@ impl TranspileCache {
     /// to rule out a hash collision returning the wrong JS.
     pub fn get_or_transpile(&self, source: &str) -> Result<Transpiled, TranspileError> {
         let key = hash(source);
-        if let Some(hit) = self.inner.borrow_mut().get(&key) {
+        if let Some(hit) = self.inner.borrow_mut().entries.get(&key) {
             if hit.source == source {
                 return Ok(hit.transpiled.clone());
             }
@@ -168,12 +208,13 @@ impl TranspileCache {
             js: Rc::from(js.as_str()),
             map_json: map_json.map(|m| Rc::from(m.as_str())),
         };
-        self.inner.borrow_mut().put(
+        self.inner.borrow_mut().insert(
             key,
             CachedModule {
                 source: source.to_owned(),
                 transpiled: transpiled.clone(),
             },
+            CACHE_BYTE_BUDGET,
         );
         Ok(transpiled)
     }
@@ -222,6 +263,111 @@ mod tests {
         let a = cache.get_or_transpile("const a: number = 1; a;").unwrap();
         let b = cache.get_or_transpile("const a: number = 1; a;").unwrap();
         assert_eq!(a.js, b.js);
+        assert!(Rc::ptr_eq(&a.js, &b.js));
+        let state = cache.inner.borrow();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(
+            state.bytes,
+            state
+                .entries
+                .peek(&hash("const a: number = 1; a;"))
+                .unwrap()
+                .byte_len()
+        );
         assert_eq!(a.module_id, b.module_id);
+    }
+
+    fn module(source: &str, js: &str, map: Option<&str>) -> CachedModule {
+        CachedModule {
+            source: source.to_owned(),
+            transpiled: Transpiled {
+                module_id: "guest.ts".to_owned(),
+                js: Rc::from(js),
+                map_json: map.map(Rc::from),
+            },
+        }
+    }
+
+    fn state(capacity: usize) -> CacheState {
+        CacheState {
+            entries: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            bytes: 0,
+        }
+    }
+
+    #[test]
+    fn cache_accounts_source_js_and_map_bytes() {
+        let mut cache = state(8);
+        cache.insert(1, module("é", "abc", Some("map")), 32);
+        assert_eq!(cache.bytes, 8);
+        cache.insert(2, module("src", "js", None), 32);
+        assert_eq!(cache.bytes, 13);
+    }
+
+    #[test]
+    fn cache_evicts_lru_for_entry_and_byte_limits() {
+        let mut cache = state(2);
+        cache.insert(1, module("one", "js", None), 12);
+        cache.insert(2, module("two", "js", None), 12);
+        cache.entries.get(&1);
+        cache.insert(3, module("three", "js", None), 12);
+        assert!(cache.entries.peek(&2).is_none());
+        assert!(cache.entries.peek(&1).is_some());
+        assert_eq!(cache.bytes, 12);
+
+        cache.insert(4, module("four", "js", None), 12);
+        assert!(cache.entries.peek(&1).is_none());
+        assert!(cache.entries.peek(&3).is_none());
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 6);
+    }
+
+    #[test]
+    fn cache_entry_limit_evicts_even_with_byte_budget_remaining() {
+        let mut cache = state(2);
+        cache.insert(1, module("one", "js", None), 100);
+        cache.insert(2, module("two", "js", None), 100);
+        cache.entries.get(&1);
+        cache.insert(3, module("three", "js", None), 100);
+        assert!(cache.entries.peek(&2).is_none());
+        assert!(cache.entries.peek(&1).is_some());
+        assert!(cache.entries.peek(&3).is_some());
+        assert_eq!(cache.bytes, 12);
+    }
+
+    #[test]
+    fn cache_replacements_and_oversized_entries_preserve_accounting() {
+        let mut cache = state(8);
+        cache.insert(1, module("one", "js", Some("map")), 10);
+        cache.insert(1, module("two", "js", None), 10);
+        assert_eq!(cache.bytes, 5);
+        assert_eq!(cache.entries.len(), 1);
+        cache.insert(1, module("too large", "js", None), 10);
+        assert_eq!(cache.bytes, 5);
+        assert_eq!(cache.entries.peek(&1).unwrap().source, "two");
+        cache.insert(2, module("oversized", "js", None), 10);
+        assert_eq!(cache.entries.len(), 1);
+        cache.insert(2, module("small", "12345", None), 10);
+        assert_eq!(cache.bytes, 10);
+        assert!(cache.entries.peek(&1).is_none());
+    }
+
+    #[test]
+    fn hash_collision_transpiles_and_replaces_wrong_entry() {
+        let cache = TranspileCache::new(8);
+        let source = "const correct: number = 42; correct;";
+        cache.inner.borrow_mut().insert(
+            hash(source),
+            module("different source", "wrong JS", Some("wrong map")),
+            CACHE_BYTE_BUDGET,
+        );
+        let output = cache.get_or_transpile(source).unwrap();
+        assert!(output.js.contains("42"));
+        assert!(!output.js.contains("wrong JS"));
+        let state = cache.inner.borrow();
+        assert_eq!(state.entries.len(), 1);
+        let entry = state.entries.peek(&hash(source)).unwrap();
+        assert_eq!(entry.source, source);
+        assert_eq!(state.bytes, entry.byte_len());
     }
 }
