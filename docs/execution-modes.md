@@ -129,3 +129,12 @@ registry is reclaimed shortly after PHP lets go. In isolated mode the whole real
 - **Strongest isolation:** a brand-new `QuickJS` per tenant. That gives a fresh
   host-side capability registrations and handles too. Isolated mode already
   gives each eval a separate heap and memory limit.
+
+## JavaScript without transpilation
+
+`eval(string $code, bool $typescript = true)` uses Oxc and source maps by
+default. For JavaScript that is already ready to execute, pass
+`$js->eval($source, typescript: false)` to skip Oxc and its transpile cache.
+Both paths use the same bridge, Promise awaiting and resource limits, in both
+execution modes. JavaScript errors retain their original `guest.js` coordinates;
+TypeScript errors are remapped to `guest.ts`.

@@ -85,31 +85,37 @@ impl QuickJS {
             .map_err(PhpException::default)
     }
 
-    /// Evaluate JS source and marshal the result back to a PHP value. The
-    /// `php.*` facade is installed fresh from the current manifest first.
-    pub fn eval(&self, code: String) -> PhpResult<Zval> {
+    /// Evaluate source and marshal its result back to PHP. TypeScript is
+    /// transpiled by default; false executes JavaScript directly.
+    #[php(defaults(typescript = true))]
+    pub fn eval(&self, code: String, typescript: bool) -> PhpResult<Zval> {
         if self.engine.is_active() {
             return Err(PhpException::default(
                 "Cannot eval while JavaScript is executing; use a JS callback".to_owned(),
             ));
         }
-        // TypeScript fast path: transpile to JS (types erased, esnext) before
-        // QuickJS ever sees the source. Transpile/syntax errors surface here,
-        // located at their original TS line/column.
-        let module = self.engine.transpile.get_or_transpile(&code).map_err(|e| {
-            let stack = if e.line > 0 {
-                format!("    at guest.ts:{}:{}", e.line, e.col)
-            } else {
-                String::new()
-            };
-            exceptions::eval_exception(
-                "SyntaxError".to_owned(),
-                e.message,
-                "guest.ts",
-                e.line,
-                stack,
-            )
-        })?;
+        let module = if typescript {
+            self.engine.transpile.get_or_transpile(&code).map_err(|e| {
+                let stack = if e.line > 0 {
+                    format!("    at guest.ts:{}:{}", e.line, e.col)
+                } else {
+                    String::new()
+                };
+                exceptions::eval_exception(
+                    "SyntaxError".to_owned(),
+                    e.message,
+                    "guest.ts",
+                    e.line,
+                    stack,
+                )
+            })?
+        } else {
+            transpile::Transpiled {
+                module_id: "guest.js".to_owned(),
+                js: Rc::from(code),
+                map_json: None,
+            }
+        };
 
         let state = self.engine.state.clone();
         self.engine.eval_in(|ctx| {
@@ -264,11 +270,11 @@ impl QuickJS {
         }
         // Remap the guest stack to TypeScript coordinates (guest frames only),
         // and surface it as a structured, JS-error-like exception.
-        let remapped = parts
-            .stack
-            .as_deref()
-            .zip(map_json)
-            .and_then(|(stack, map)| error::remap_stack(stack, map, module_id));
+        let remapped = match (parts.stack.as_deref(), map_json) {
+            (Some(stack), Some(map)) => error::remap_stack(stack, map, module_id),
+            (Some(stack), None) => Some(stack.to_owned()),
+            (None, _) => None,
+        };
         let (line, _) = remapped
             .as_deref()
             .and_then(|s| error::top_frame_location(s, module_id))

@@ -1,8 +1,10 @@
 # Errors
 
 Errors cross the boundary in both directions, and a JS/TS error that escapes
-`eval()` surfaces as a real, typed PHP exception located at its **original
-TypeScript** coordinates.
+`eval()` surfaces as a real, typed PHP exception. With the default
+`typescript: true`, source maps recover the original TypeScript coordinates.
+With `typescript: false`, JavaScript executes directly and errors retain their
+original `guest.js` coordinates.
 
 ## Exception hierarchy
 
@@ -52,18 +54,29 @@ What each accessor gives you:
 
 - **`getMessage()`** — the error text only (`"TypeError: boom"`), with a bare
   `Error` name elided to avoid a redundant prefix.
-- **`getFile()` / `getLine()`** — the original **TS** location, so the standard
-  PHP idioms (`getLine()`, `getTraceAsString()`, `(string) $e`) read naturally.
+- **`getFile()` / `getLine()`** — the original source location: `guest.ts`
+  with transpilation, or `guest.js` for direct JavaScript.
 - **`getJsName()`** — the JS error constructor (`TypeError`, `RangeError`, a
   custom subclass name, …), or the originating PHP class for a re-surfaced host
   error.
-- **`getJsStack()`** — the stack **remapped to TS coordinates** and **filtered to
-  guest frames**: the internal bridge/bootstrap frames are removed, so it reads
-  like a plain TS trace.
+- **`getJsStack()`** — with transpilation, the stack is remapped to TS
+  coordinates and filtered to guest frames. Direct JavaScript retains its
+  original stack, including any bridge frames.
+
+For direct JavaScript, no source map is needed:
+
+```php
+try {
+    $js->eval("\n\nthrow new TypeError('boom');", typescript: false);
+} catch (QuickJSEvalException $e) {
+    $e->getFile();  // "guest.js"
+    $e->getLine();  // 3
+}
+```
 
 ### How the remapping works
 
-The module is named `guest.ts` when handed to QuickJS, so stack frames reference
+With `typescript: true`, the module is named `guest.ts` when handed to QuickJS, so stack frames reference
 it. On a throw, `error.rs` reads the JS stack (generated-JS coordinates), and for
 each frame referencing the guest module it looks the position up in the module's
 **source map** (kept host-side from transpilation) and rewrites it to the
@@ -84,8 +97,9 @@ collapsing to a generic "uncaught" string.
 ### Syntax / transpile errors are located
 
 A guest that doesn't parse surfaces as a `QuickJSEvalException` with
-`getJsName() === 'SyntaxError'` and `getLine()` pointing at the offending TS line
-(computed from the oxc diagnostic's span).
+`getJsName() === 'SyntaxError'` and `getLine()` pointing at the offending source
+line. With transpilation, the location comes from the Oxc diagnostic's span;
+with direct JavaScript, it comes from QuickJS's original stack.
 
 ### Resource limits
 

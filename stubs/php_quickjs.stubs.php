@@ -30,8 +30,11 @@ class QuickJS
      */
     public function register(string $name, callable $callable, ?string $types = null): void {}
 
-    /** Evaluate JS source and marshal the result back to PHP, awaiting a returned Promise. */
-    public function eval(string $code): mixed {}
+    /**
+     * Evaluate source and marshal the result back to PHP, awaiting a returned Promise.
+     * TypeScript is transpiled by default; false executes JavaScript directly.
+     */
+    public function eval(string $code, bool $typescript = true): mixed {}
 
     /** The registration manifest: a list of `['name' => string, 'types' => ?string]`. */
     public function manifest(): array {}
@@ -83,14 +86,15 @@ namespace {
 
     /**
      * A JavaScript/TypeScript error escaped `eval`. `getMessage()` is the clean
-     * error text and `getFile()`/`getLine()` carry the original TS location.
+     * error text and `getFile()`/`getLine()` carry the original source location
+     * (guest.ts after remapping, or guest.js with typescript: false).
      */
     class QuickJSEvalException extends QuickJSException
     {
         /** The JS error constructor name (e.g. "TypeError"), or the PHP class for a re-surfaced host error. */
         public function getJsName(): string {}
 
-        /** The stack trace, remapped to TypeScript coordinates and filtered to guest frames. */
+        /** The remapped guest-only TypeScript stack, or the original direct JavaScript stack. */
         public function getJsStack(): string {}
     }
 
