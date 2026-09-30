@@ -45,8 +45,9 @@ test-php: build
 # Regenerate the IDE stub for the PHP-facing classes (requires cargo-php:
 #   cargo install cargo-php).
 stubs:
-	cargo php stubs --stdout > stubs/php_quickjs.stubs.php || \
-	  echo "cargo-php not installed; run 'cargo install cargo-php'"
+	@tmp=$$(mktemp stubs/php_quickjs.stubs.php.XXXXXX); \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	cargo php stubs --stdout > "$$tmp" && mv "$$tmp" stubs/php_quickjs.stubs.php
 
 example: build
 	@for ex in examples/*.php; do \

@@ -28,7 +28,7 @@ class QuickJS
      * @param callable    $callable
      * @param string|null $types    Optional TypeScript signature for `dts()`.
      */
-    public function register(string $name, callable $callable, ?string $types = null): void {}
+    public function register(string $name, mixed $callable, ?string $types = null): void {}
 
     /**
      * Evaluate source and marshal the result back to PHP, awaiting a returned Promise.
@@ -36,8 +36,11 @@ class QuickJS
      */
     public function eval(string $code, bool $typescript = true): mixed {}
 
-    /** The registration manifest: a list of `['name' => string, 'types' => ?string]`. */
-    public function manifest(): array {}
+    /**
+     * The registration manifest.
+     * @return list<array{name: string, types: ?string}>
+     */
+    public function manifest(): mixed {}
 
     /** Whether Promise jobs are ready (shared mode only). Does not include host I/O. */
     public function hasPendingJobs(): bool {}
@@ -45,8 +48,11 @@ class QuickJS
     /** Execute at most maxJobs ready jobs without waiting for I/O; returns the count. */
     public function executePendingJobs(int $maxJobs = 100): int {}
 
-    /** Drain bounded messages emitted by quickjs.postMessage() without entering JS. */
-    public function drainMessages(): array {}
+    /**
+     * Drain bounded messages emitted by quickjs.postMessage() without entering JS.
+     * @return list<mixed>
+     */
+    public function drainMessages(): mixed {}
 
     /** Generate TypeScript `.d.ts` declarations for the `php` and `quickjs` globals. */
     public function dts(): string {}
@@ -72,6 +78,9 @@ namespace Js {
      */
     class Callback
     {
+        /** Native constructor exists, but callbacks are created only by the bridge. */
+        public function __construct() {}
+
         /** Invoke the JS function, awaiting a returned Promise. */
         public function __invoke(mixed ...$args): mixed {}
 
@@ -82,7 +91,11 @@ namespace Js {
 
 namespace {
     /** Base class for every exception thrown by the extension. */
-    class QuickJSException extends \Exception {}
+    class QuickJSException extends \Exception
+    {
+        /** Native constructor exists; exceptions are created by the extension. */
+        public function __construct() {}
+    }
 
     /**
      * A JavaScript/TypeScript error escaped `eval`. `getMessage()` is the clean
@@ -91,6 +104,9 @@ namespace {
      */
     class QuickJSEvalException extends QuickJSException
     {
+        /** Native constructor exists; exceptions are created by the extension. */
+        public function __construct() {}
+
         /** The JS error constructor name (e.g. "TypeError"), or the PHP class for a re-surfaced host error. */
         public function getJsName(): string {}
 
@@ -99,8 +115,16 @@ namespace {
     }
 
     /** The wall-clock deadline tripped during `eval`. */
-    class QuickJSTimeoutException extends QuickJSException {}
+    class QuickJSTimeoutException extends QuickJSException
+    {
+        /** Native constructor exists; exceptions are created by the extension. */
+        public function __construct() {}
+    }
 
     /** The memory limit tripped during `eval`. */
-    class QuickJSMemoryException extends QuickJSException {}
+    class QuickJSMemoryException extends QuickJSException
+    {
+        /** Native constructor exists; exceptions are created by the extension. */
+        public function __construct() {}
+    }
 }

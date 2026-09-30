@@ -6,7 +6,8 @@ The extension exposes a single `QuickJS` class. For the bigger picture see
 
 ### `new QuickJS(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false, ?int $maxQueuedMessageBytes = null)`
 
-Limits default to unbounded; pass non-zero values to contain resource abuse.
+`memoryLimit` and `timeoutMs` default to unbounded; pass non-zero values to
+contain resource abuse. `maxStack` defaults to the engine stack limit.
 `isolated: true` runs each `eval()` in a fresh realm (see
 [execution modes](execution-modes.md)).
 `maxQueuedMessageBytes` defaults to 32 MiB and must be positive. `timeoutMs`
@@ -18,10 +19,17 @@ Expose a PHP callable to JS under a flat, dotted name — it becomes
 `php.<dotted.name>(...)` in the guest. `$types` is an optional TypeScript signature
 surfaced by `dts()`. This flat registry is the PHP callback allowlist.
 
-### `eval(string $code): mixed`
+### `eval(string $code, bool $typescript = true): mixed`
 
-Run TypeScript or JavaScript, await a returned Promise, and marshal its result to PHP. Errors raise a
-`QuickJSEvalException` located at the original TS line/column (see [errors](errors.md)).
+With `typescript: true`, transpile TypeScript or JavaScript with Oxc and remap
+errors to the input source. With `typescript: false`, execute JavaScript directly;
+errors retain the original JavaScript coordinates. Both paths await a returned
+Promise and marshal the result to PHP. Errors raise `QuickJSEvalException`
+(see [errors](errors.md)).
+
+The TypeScript cache retains at most 256 entries and 32 MiB of source, generated
+JavaScript and source-map strings. An entry larger than the budget is evaluated
+without caching. These are cache limits, not a bound on all Oxc allocations.
 
 ### `grant(mixed $resource): int` / `resolve(int $h): mixed` / `revoke(int $h): bool`
 
@@ -75,3 +83,12 @@ Fiber boundaries.
 Return and clear messages sent by JS through `quickjs.postMessage(value)`.
 Values are copied at send time and contain data only. This method does not
 enter JS or execute jobs. See [asynchronous execution](async.md) for limits.
+
+## Separate resource limits
+
+`memoryLimit` applies to the QuickJS heap, not PHP allocations or the transpiler.
+Native conversion limits values to 64 nesting levels and does not impose a
+16 MiB per-value byte limit. The message queue has its own aggregate accounted
+byte limit through `maxQueuedMessageBytes`, including per-message and container
+overhead; draining messages releases this budget. Neither that queue budget nor
+the 32 MiB TypeScript cache budget replaces the heap limit.

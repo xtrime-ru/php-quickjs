@@ -8,7 +8,8 @@ directly in your PHP process. Guest code runs in an isolated context with memory
 time, and stack limits; PHP exposes a controlled allowlist of capabilities into JS;
 and values, functions, and errors cross the boundary both ways. Guest code may be
 TypeScript — it's transpiled in-process and runtime errors map back to the original
-TS source.
+TS source. Pass `typescript: false` to `eval()` for JavaScript that should run
+directly without transpilation.
 
 Built in Rust with [`ext-php-rs`](https://github.com/davidcole1340/ext-php-rs) and
 [`rquickjs`](https://github.com/DelSkayn/rquickjs). QuickJS-NG is bundled — no system
@@ -134,6 +135,14 @@ and read them using `QuickJS::drainMessages()`. The native queue snapshots value
 at send time and has a configurable aggregate byte limit. `timeoutMs` remains an
 optional wall-clock limit for a complete call, including Promise waits.
 
+Resource budgets are separate: `memoryLimit` bounds the QuickJS heap, while
+`maxQueuedMessageBytes` bounds retained native messages (32 MiB by default,
+including accounting overhead). Native value conversion permits nesting up to
+64 levels; it has no separate 16 MiB value limit. The TypeScript LRU cache holds
+at most 256 entries and 32 MiB of source, generated JavaScript and source-map
+strings. This cache budget does not bound temporary Oxc allocations. Direct
+JavaScript evaluation with `typescript: false` bypasses Oxc and this cache.
+
 ## Scope
 
 This is an *embedder*, not a standalone defence against hostile code. The capability
@@ -152,6 +161,13 @@ attacker-controlled code, nest the extension inside an outer microVM / gVisor bo
   callback lifecycle.
 - [Errors](docs/errors.md) — typed exceptions, both-way bridging, and TypeScript
   remapping.
+
+## Development
+
+`make stubs` regenerates the canonical IDE declarations atomically; failed
+generation leaves the previous file intact. The PHP test suite compares these
+signatures against the loaded extension. Consumers such as puphpeteer copy this
+file for static analysis and should keep their copy synchronized.
 
 ## License
 
