@@ -144,10 +144,7 @@ impl Engine {
             self.check_deadline(ctx)?;
             if result < 0 {
                 let c = unsafe { Ctx::from_raw(NonNull::new(job_ctx).expect("job error context")) };
-                return Err(crate::error::js_error_to_php(
-                    &c,
-                    rquickjs::Error::Exception,
-                ));
+                return Err(self.callback_error(&c, rquickjs::Error::Exception));
             }
             if result == 0 {
                 break;
@@ -457,14 +454,16 @@ impl Engine {
         ctx: &Ctx<'_>,
         err: rquickjs::Error,
     ) -> ext_php_rs::exception::PhpException {
-        if self.timed_out() {
-            // Consume the interrupted JS exception before the next entry.
-            drop(ctx.catch());
+        let parts = crate::error::js_error_parts(ctx, err);
+        if matches!(
+            crate::error::resource_error(&parts, self.timed_out()),
+            Some(crate::error::ResourceError::Timeout)
+        ) {
             return ext_php_rs::exception::PhpException::from_class::<
                 crate::exceptions::QuickJSTimeoutException,
             >("JavaScript callback execution timed out".to_owned());
         }
-        crate::error::js_error_to_php(ctx, err)
+        crate::error::js_error_to_php(parts)
     }
 
     /// Enter one level of cross-boundary nesting; errors if the cap is hit.

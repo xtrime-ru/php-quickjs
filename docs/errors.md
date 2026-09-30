@@ -103,10 +103,11 @@ with direct JavaScript, it comes from QuickJS's original stack.
 
 ### Resource limits
 
-An infinite loop or over-budget script raises `QuickJSTimeoutException`; an
-allocation bomb raises `QuickJSMemoryException`. These fire from the interrupt
-handler / allocator and so carry no meaningful source location. The engine
-recovers and remains usable afterward.
+An infinite loop or over-budget eval, callback or job batch raises
+`QuickJSTimeoutException`. An allocation failure from `eval()` raises
+`QuickJSMemoryException`; callbacks and jobs retain their existing
+`QuickJSEvalException` mapping for memory errors. Resource errors carry no
+meaningful source location. The engine recovers and remains usable afterward.
 
 ## PHP exception → JS
 

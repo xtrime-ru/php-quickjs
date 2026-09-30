@@ -87,6 +87,24 @@ impl JsErrorParts {
     }
 }
 
+/// Shared resource-error detection. Callers retain their existing exception
+/// mapping: eval specializes memory errors; callback/jobs keep their old type.
+#[derive(Clone, Copy)]
+pub enum ResourceError {
+    Timeout,
+    Memory,
+}
+
+pub fn resource_error(parts: &JsErrorParts, timed_out: bool) -> Option<ResourceError> {
+    if timed_out {
+        Some(ResourceError::Timeout)
+    } else if parts.display_message().to_lowercase().contains("out of memory") {
+        Some(ResourceError::Memory)
+    } else {
+        None
+    }
+}
+
 /// Render an rquickjs error into a human-readable `Name: message` string.
 pub fn js_error_message(ctx: &Ctx<'_>, err: JsError) -> String {
     js_error_parts(ctx, err).display_message()
@@ -145,8 +163,7 @@ pub fn js_error_parts(ctx: &Ctx<'_>, err: JsError) -> JsErrorParts {
 /// `phpClass`), the original PHP class is restored with a clean message;
 /// otherwise it becomes a `QuickJSEvalException`. This unwraps the
 /// JS->PHP->JS->PHP round trip instead of nesting `Exception:` prefixes.
-pub fn js_error_to_php(ctx: &Ctx<'_>, err: JsError) -> PhpException {
-    let parts = js_error_parts(ctx, err);
+pub fn js_error_to_php(parts: JsErrorParts) -> PhpException {
     if let Some(class) = parts.php_class.as_deref() {
         if let Some(ce) = ClassEntry::try_find(class) {
             return PhpException::new(parts.message, 0, ce);

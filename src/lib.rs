@@ -262,11 +262,14 @@ impl QuickJS {
     ) -> PhpException {
         let parts = error::js_error_parts(ctx, err);
         let message = parts.display_message();
-        if self.engine.timed_out() {
-            return PhpException::from_class::<QuickJSTimeoutException>(message);
-        }
-        if message.to_lowercase().contains("out of memory") {
-            return PhpException::from_class::<QuickJSMemoryException>(message);
+        match error::resource_error(&parts, self.engine.timed_out()) {
+            Some(error::ResourceError::Timeout) => {
+                return PhpException::from_class::<QuickJSTimeoutException>(message);
+            }
+            Some(error::ResourceError::Memory) => {
+                return PhpException::from_class::<QuickJSMemoryException>(message);
+            }
+            None => {}
         }
         // Remap the guest stack to TypeScript coordinates (guest frames only),
         // and surface it as a structured, JS-error-like exception.
