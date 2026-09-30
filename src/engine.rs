@@ -24,7 +24,6 @@ pub const MAX_DEPTH: usize = 200;
 
 /// The QuickJS engine: runtime + context + the shared bridge state.
 pub struct Engine {
-    pub rt: Runtime,
     pub state: Rc<BridgeState>,
     memory_limit: usize,
     max_stack: usize,
@@ -332,22 +331,22 @@ impl Engine {
         isolated: bool,
         max_queued_message_bytes: usize,
     ) -> rquickjs::Result<Rc<Self>> {
-        let rt = Runtime::new()?;
-        sandbox::apply_limits(&rt, memory_limit, max_stack);
         let deadline = Rc::new(Cell::new(None));
         let timed_out = Rc::new(Cell::new(false));
-        sandbox::install_interrupt(&rt, deadline.clone(), timed_out.clone());
 
         // Shared mode: one persistent realm. Isolated mode: a fresh realm per
         // eval (so each eval is its own world; cross-eval state is not kept).
         let shared_ctx = if isolated {
             None
         } else {
+            let rt = Runtime::new()?;
+            sandbox::apply_limits(&rt, memory_limit, max_stack);
+            sandbox::install_interrupt(&rt, deadline.clone(), timed_out.clone());
+            // Context owns a runtime reference; no extra Engine runtime is needed.
             Some(Context::full(&rt)?)
         };
         let state = BridgeState::new(max_queued_message_bytes);
         let engine = Rc::new(Engine {
-            rt,
             state: state.clone(),
             memory_limit,
             max_stack,
