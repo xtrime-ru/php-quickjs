@@ -327,6 +327,8 @@ impl Engine {
         max_stack: usize,
         isolated: bool,
         max_queued_message_bytes: usize,
+        transpile_cache_max_entries: usize,
+        transpile_cache_max_bytes: usize,
     ) -> rquickjs::Result<Rc<Self>> {
         let deadline = Rc::new(Cell::new(None));
         let timed_out = Rc::new(Cell::new(false));
@@ -348,7 +350,7 @@ impl Engine {
             memory_limit,
             max_stack,
             realm_id: Cell::new(0),
-            transpile: TranspileCache::new(256),
+            transpile: TranspileCache::new(transpile_cache_max_entries, transpile_cache_max_bytes),
             shared_ctx,
             depth: Cell::new(0),
             active_ctx: Cell::new(None),

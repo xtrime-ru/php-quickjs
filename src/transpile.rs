@@ -130,6 +130,7 @@ impl CompilerInterface for TsCompiler {
 // content-addressed cache
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 const CACHE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 struct CachedModule {
@@ -176,12 +177,14 @@ impl CacheState {
 /// (PHP NTS), so a `RefCell` is sufficient.
 pub struct TranspileCache {
     inner: RefCell<CacheState>,
+    byte_budget: usize,
 }
 
 impl TranspileCache {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, byte_budget: usize) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         TranspileCache {
+            byte_budget: if capacity == 0 { 0 } else { byte_budget },
             inner: RefCell::new(CacheState {
                 entries: LruCache::new(cap),
                 bytes: 0,
@@ -208,14 +211,16 @@ impl TranspileCache {
             js: Rc::from(js.as_str()),
             map_json: map_json.map(|m| Rc::from(m.as_str())),
         };
-        self.inner.borrow_mut().insert(
-            key,
-            CachedModule {
-                source: source.to_owned(),
-                transpiled: transpiled.clone(),
-            },
-            CACHE_BYTE_BUDGET,
-        );
+        if self.byte_budget > 0 {
+            self.inner.borrow_mut().insert(
+                key,
+                CachedModule {
+                    source: source.to_owned(),
+                    transpiled: transpiled.clone(),
+                },
+                self.byte_budget,
+            );
+        }
         Ok(transpiled)
     }
 }
@@ -259,7 +264,7 @@ mod tests {
 
     #[test]
     fn cache_hits_return_same_output() {
-        let cache = TranspileCache::new(8);
+        let cache = TranspileCache::new(8, CACHE_BYTE_BUDGET);
         let a = cache.get_or_transpile("const a: number = 1; a;").unwrap();
         let b = cache.get_or_transpile("const a: number = 1; a;").unwrap();
         assert_eq!(a.js, b.js);
@@ -275,6 +280,28 @@ mod tests {
                 .byte_len()
         );
         assert_eq!(a.module_id, b.module_id);
+    }
+
+    #[test]
+    fn configurable_limits_can_disable_or_bound_cache() {
+        let source = "const answer: number = 42; answer;";
+        for (entries, bytes) in [(0, CACHE_BYTE_BUDGET), (8, 0), (8, 1)] {
+            let cache = TranspileCache::new(entries, bytes);
+            let first = cache.get_or_transpile(source).unwrap();
+            let second = cache.get_or_transpile(source).unwrap();
+            assert_eq!(first.js, second.js);
+            assert!(!Rc::ptr_eq(&first.js, &second.js));
+            assert!(cache.inner.borrow().entries.is_empty());
+            assert_eq!(cache.inner.borrow().bytes, 0);
+        }
+        let cache = TranspileCache::new(1, CACHE_BYTE_BUDGET);
+        let first = cache.get_or_transpile(source).unwrap();
+        cache
+            .get_or_transpile("const other: number = 1; other;")
+            .unwrap();
+        let repeated = cache.get_or_transpile(source).unwrap();
+        assert!(!Rc::ptr_eq(&first.js, &repeated.js));
+        assert_eq!(cache.inner.borrow().entries.len(), 1);
     }
 
     fn module(source: &str, js: &str, map: Option<&str>) -> CachedModule {
@@ -354,7 +381,7 @@ mod tests {
 
     #[test]
     fn hash_collision_transpiles_and_replaces_wrong_entry() {
-        let cache = TranspileCache::new(8);
+        let cache = TranspileCache::new(8, CACHE_BYTE_BUDGET);
         let source = "const correct: number = 42; correct;";
         cache.inner.borrow_mut().insert(
             hash(source),

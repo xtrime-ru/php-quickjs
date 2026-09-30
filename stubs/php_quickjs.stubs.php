@@ -17,8 +17,10 @@ class QuickJS
      * @param int|null $maxStack    Max native stack bytes (0/null = engine default).
      * @param bool     $isolated    Run each eval() in its own fresh global realm.
      * @param int|null $maxQueuedMessageBytes Max accounted bytes in the message queue (null = 32 MiB).
+     * @param int $transpileCacheMaxBytes Retained cache string bytes (0 disables cache).
+     * @param int $transpileCacheMaxEntries Retained cache entries (0 disables cache).
      */
-    public function __construct(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false, ?int $maxQueuedMessageBytes = null) {}
+    public function __construct(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false, ?int $maxQueuedMessageBytes = null, int $transpileCacheMaxBytes = 33554432, int $transpileCacheMaxEntries = 256) {}
 
     /**
      * Register a PHP callable under a flat, dotted capability name, callable

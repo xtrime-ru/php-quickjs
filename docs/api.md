@@ -4,7 +4,7 @@ The extension exposes a single `QuickJS` class. For the bigger picture see
 [architecture](architecture.md); for realms and the callback lifecycle see
 [execution modes](execution-modes.md).
 
-### `new QuickJS(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false, ?int $maxQueuedMessageBytes = null)`
+### `new QuickJS(?int $memoryLimit = null, ?int $timeoutMs = null, ?int $maxStack = null, bool $isolated = false, ?int $maxQueuedMessageBytes = null, int $transpileCacheMaxBytes = 33554432, int $transpileCacheMaxEntries = 256)`
 
 `memoryLimit` and `timeoutMs` default to unbounded; pass non-zero values to
 contain resource abuse. `maxStack` defaults to the engine stack limit.
@@ -27,9 +27,11 @@ errors retain the original JavaScript coordinates. Both paths await a returned
 Promise and marshal the result to PHP. Errors raise `QuickJSEvalException`
 (see [errors](errors.md)).
 
-The TypeScript cache retains at most 256 entries and 32 MiB of source, generated
+The TypeScript cache defaults to at most 256 entries and 32 MiB of source, generated
 JavaScript and source-map strings. An entry larger than the budget is evaluated
-without caching. These are cache limits, not a bound on all Oxc allocations.
+without caching. Set `transpileCacheMaxBytes` and `transpileCacheMaxEntries`
+in the constructor to change these limits. Both must be non-negative; setting
+either to `0` disables caching. These are cache limits, not a bound on all Oxc allocations.
 
 ### `grant(mixed $resource): int` / `resolve(int $h): mixed` / `revoke(int $h): bool`
 

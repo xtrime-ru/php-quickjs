@@ -138,9 +138,11 @@ optional wall-clock limit for a complete call, including Promise waits.
 Resource budgets are separate: `memoryLimit` bounds the QuickJS heap, while
 `maxQueuedMessageBytes` bounds retained native messages (32 MiB by default,
 including accounting overhead). Native value conversion permits nesting up to
-64 levels; it has no separate 16 MiB value limit. The TypeScript LRU cache holds
+64 levels; it has no separate 16 MiB value limit. The TypeScript LRU cache defaults to
 at most 256 entries and 32 MiB of source, generated JavaScript and source-map
-strings. This cache budget does not bound temporary Oxc allocations. Direct
+strings. Set constructor arguments `transpileCacheMaxBytes` and
+`transpileCacheMaxEntries` to customize these limits; both are non-negative, and
+`0` in either disables caching. This cache budget does not bound temporary Oxc allocations. Direct
 JavaScript evaluation with `typescript: false` bypasses Oxc and this cache.
 
 ## Scope

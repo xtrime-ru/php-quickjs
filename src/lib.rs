@@ -31,22 +31,25 @@ pub struct QuickJS {
 
 #[php_impl]
 impl QuickJS {
-    /// Construct a sandbox. All limits default to unbounded; pass non-zero
-    /// values to contain resource abuse:
+    /// Construct a sandbox. Heap and time limits default to unbounded:
     /// - `memoryLimit`: max heap bytes (alloc-bomb guard)
     /// - `timeoutMs`: wall-clock budget per eval, callback, or job batch
     /// - `maxStack`: max native stack bytes
     /// - `maxQueuedMessageBytes`: maximum accounted bytes waiting in the message queue
+    /// - `transpileCacheMaxBytes`: retained cache strings (default 32 MiB; 0 disables cache)
+    /// - `transpileCacheMaxEntries`: retained cache entries (default 256; 0 disables cache)
     /// - `isolated`: when true, each `eval()` runs in a fresh global realm (its
     ///   own world); cross-eval globals and persistent JS callbacks are not
     ///   kept. Defaults to false (one shared, persistent realm per instance).
-    #[php(defaults(memoryLimit = None, timeoutMs = None, maxStack = None, isolated = false, maxQueuedMessageBytes = None))]
+    #[php(defaults(memoryLimit = None, timeoutMs = None, maxStack = None, isolated = false, maxQueuedMessageBytes = None, transpileCacheMaxBytes = 33554432, transpileCacheMaxEntries = 256))]
     pub fn __construct(
         memoryLimit: Option<i64>,
         timeoutMs: Option<i64>,
         maxStack: Option<i64>,
         isolated: bool,
         maxQueuedMessageBytes: Option<i64>,
+        transpileCacheMaxBytes: i64,
+        transpileCacheMaxEntries: i64,
     ) -> PhpResult<Self> {
         let max_queued_message_bytes = match maxQueuedMessageBytes {
             None => bridge::DEFAULT_MAX_QUEUED_MESSAGE_BYTES,
@@ -59,12 +62,24 @@ impl QuickJS {
                 ))
             }
         };
+        let transpile_cache_max_bytes = usize::try_from(transpileCacheMaxBytes).map_err(|_| {
+            PhpException::default(
+                "transpileCacheMaxBytes must be a non-negative integer fitting usize".to_owned(),
+            )
+        })?;
+        let transpile_cache_max_entries = usize::try_from(transpileCacheMaxEntries).map_err(|_| {
+            PhpException::default(
+                "transpileCacheMaxEntries must be a non-negative integer fitting usize".to_owned(),
+            )
+        })?;
         let engine = Engine::new(
             memoryLimit.unwrap_or(0).max(0) as usize,
             timeoutMs.unwrap_or(0).max(0) as u64,
             maxStack.unwrap_or(0).max(0) as usize,
             isolated,
             max_queued_message_bytes,
+            transpile_cache_max_entries,
+            transpile_cache_max_bytes,
         )
         .map_err(to_php_err)?;
         Ok(QuickJS { engine })
