@@ -33,6 +33,14 @@ impl HostError {
 pub fn php_exception_info(err: PhpError) -> HostError {
     match err {
         PhpError::ExceptionPending { class } => {
+            unsafe extern "C" {
+                fn php_quickjs_is_unwinding() -> bool;
+            }
+            // Fiber/request termination must propagate through PHP, not become
+            // a catchable JS exception or have its special Zend object inspected.
+            if unsafe { php_quickjs_is_unwinding() } {
+                return HostError::internal("PHP execution ended");
+            }
             let Some(obj) = ExecutorGlobals::take_exception() else {
                 return HostError::internal(format!(
                     "PHP exception of class {class} is no longer pending"

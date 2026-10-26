@@ -23,6 +23,7 @@ pub struct BridgeState {
     dispatch: RefCell<HashMap<String, Zval>>,
     /// Ordered registration manifest (drives the facade and the `.d.ts`).
     manifest: RefCell<Vec<ManifestEntry>>,
+    manifest_revision: Cell<u64>,
     /// Anonymous PHP callables handed to JS, keyed by id.
     php_funcs: RefCell<HashMap<u64, Zval>>,
     next_php: Cell<u64>,
@@ -78,6 +79,7 @@ impl BridgeState {
             manifest.push(ManifestEntry { name, types });
         }
         drop(manifest);
+        self.manifest_revision.set(self.manifest_revision.get() + 1);
         drop(previous);
         Ok(())
     }
@@ -108,6 +110,10 @@ impl BridgeState {
 
     pub fn manifest_snapshot(&self) -> Vec<ManifestEntry> {
         self.manifest.borrow().clone()
+    }
+
+    pub fn manifest_revision(&self) -> u64 {
+        self.manifest_revision.get()
     }
 
     pub fn clear(&self) {
@@ -254,6 +260,9 @@ impl MessageQueue {
     pub(crate) fn drain(&mut self) -> Vec<MiddleValue> {
         self.bytes = 0;
         std::mem::take(&mut self.messages)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.messages.is_empty()
     }
 
     pub(crate) fn remaining(&self) -> usize {

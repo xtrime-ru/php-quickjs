@@ -74,15 +74,15 @@ impl QuickJS {
                         .to_owned(),
                 )
             })?;
-        let engine = Engine::new(
-            memoryLimit.unwrap_or(0).max(0) as usize,
-            timeoutMs.unwrap_or(0).max(0) as u64,
-            maxStack.unwrap_or(0).max(0) as usize,
+        let engine = Engine::new(worker::Config {
+            memory_limit: memoryLimit.unwrap_or(0).max(0) as usize,
+            timeout_ms: timeoutMs.unwrap_or(0).max(0) as u64,
+            max_stack: maxStack.unwrap_or(0).max(0) as usize,
             isolated,
             max_queued_message_bytes,
-            transpile_cache_max_entries,
-            transpile_cache_max_bytes,
-        )?;
+            cache_entries: transpile_cache_max_entries,
+            cache_bytes: transpile_cache_max_bytes,
+        })?;
         Ok(QuickJS { engine })
     }
 
@@ -136,6 +136,13 @@ impl QuickJS {
     /// an awaiting driver yields; no JS entry or Promise job is executed.
     pub fn drainMessages(&self) -> PhpResult<Zval> {
         let messages = marshal::MiddleValue::Array(self.engine.drain_messages()?);
+        middle_to_zval(&messages, &self.engine.state).map_err(PhpException::from_message)
+    }
+
+    /// Enable automatic JS jobs and await the next non-empty message batch.
+    /// One consumer per non-isolated runtime; yields through Revolt when loaded.
+    pub fn awaitMessages(&self) -> PhpResult<Zval> {
+        let messages = marshal::MiddleValue::Array(self.engine.await_messages()?);
         middle_to_zval(&messages, &self.engine.state).map_err(PhpException::from_message)
     }
 

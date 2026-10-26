@@ -86,6 +86,14 @@ Return and clear messages sent by JS through `quickjs.postMessage(value)`.
 Values are copied at send time and contain data only. This method does not
 enter JS or execute jobs. See [asynchronous execution](async.md) for limits.
 
+### `awaitMessages(): array`
+
+Enable automatic jobs in a shared runtime and await a nonempty message batch.
+Only one consumer may wait at a time. Closing the runtime wakes the consumer
+with an exception. `Js\Callback::post(...$args): void` provides bounded,
+asynchronous dispatch for message-based bridges; failures stop the runtime and
+are delivered to the consumer. See [asynchronous execution](async.md).
+
 ## Separate resource limits
 
 `memoryLimit` applies to the QuickJS heap, not PHP allocations or the transpiler.

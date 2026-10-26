@@ -3,7 +3,7 @@
 use crate::bridge::BridgeState;
 use crate::callback::JsCallback;
 use ext_php_rs::convert::IntoZval;
-use ext_php_rs::types::{ArrayKey, ZendClassObject, ZendHashTable, Zval};
+use ext_php_rs::types::{ArrayKey, ZendClassObject, ZendHashTable, ZendStr, Zval};
 use rquickjs::{Array, Ctx, Function, Object, TypedArray, Value};
 /// The neutral value that bridges JS and PHP.
 #[derive(Debug, Clone)]
@@ -222,7 +222,7 @@ pub fn middle_to_js<'js>(ctx: &Ctx<'js>, value: &MiddleValue) -> rquickjs::Resul
         }
         MiddleValue::Float(f) => Value::new_float(ctx.clone(), *f),
         MiddleValue::Str(s) => rquickjs::String::from_str(ctx.clone(), s)?.into_value(),
-        MiddleValue::Bytes(b) => TypedArray::new(ctx.clone(), b.clone())?.into_value(),
+        MiddleValue::Bytes(b) => TypedArray::new_copy(ctx.clone(), b)?.into_value(),
         MiddleValue::Array(items) => {
             let arr = Array::new(ctx.clone())?;
             for (i, it) in items.iter().enumerate() {
@@ -363,6 +363,28 @@ impl Drop for PhpConversion<'_> {
     }
 }
 
+/// Transfer owned buffers into QuickJS instead of cloning their backing Vec.
+pub fn middle_into_js<'js>(ctx: &Ctx<'js>, value: MiddleValue) -> rquickjs::Result<Value<'js>> {
+    match value {
+        MiddleValue::Bytes(bytes) => Ok(TypedArray::new(ctx.clone(), bytes)?.into_value()),
+        MiddleValue::Array(items) => {
+            let array = Array::new(ctx.clone())?;
+            for (index, item) in items.into_iter().enumerate() {
+                array.set(index, middle_into_js(ctx, item)?)?;
+            }
+            Ok(array.into_value())
+        }
+        MiddleValue::Map(entries) => {
+            let object = Object::new(ctx.clone())?;
+            for (key, value) in entries {
+                object.set(key, middle_into_js(ctx, value)?)?;
+            }
+            Ok(object.into_value())
+        }
+        value => middle_to_js(ctx, &value),
+    }
+}
+
 /// Convert the neutral representation into a PHP value.
 pub fn middle_to_zval(value: &MiddleValue, state: &BridgeState) -> Result<Zval, String> {
     let mut zv = Zval::new();
@@ -374,7 +396,7 @@ pub fn middle_to_zval(value: &MiddleValue, state: &BridgeState) -> Result<Zval, 
         MiddleValue::Str(s) => zv
             .set_string(s, false)
             .map_err(|e| format!("string conversion failed: {e}"))?,
-        MiddleValue::Bytes(b) => zv.set_binary(b.clone()),
+        MiddleValue::Bytes(b) => zv.set_zend_string(ZendStr::new(b, false)),
         MiddleValue::Array(items) => {
             let mut ht = ZendHashTable::new();
             for it in items {

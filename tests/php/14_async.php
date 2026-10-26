@@ -12,7 +12,7 @@ $js->register('later', static function ($resolve): void {
 });
 eq(42, $js->eval('new Promise(resolve => php.later(resolve))'), 'main flow awaits external resolution');
 eq(42, Amp\async(fn() => $js->eval('new Promise(resolve => php.later(resolve))'))->await(), 'Amp Fiber awaits external resolution');
-eq([], Revolt\EventLoop::getIdentifiers(), 'completion cancels the deadline timer');
+eq([], array_values(array_filter(Revolt\EventLoop::getIdentifiers(), Revolt\EventLoop::isReferenced(...))), 'completion leaves no referenced watcher');
 
 $js->register('sleep', static function (): int { Amp\delay(0.001); return 42; });
 eq(42, Amp\async(fn() => $js->eval('(async () => php.sleep())()'))->await(), 'registered PHP callbacks may await Amp I/O');
@@ -82,7 +82,7 @@ $start = hrtime(true);
 throws(fn() => $limited->eval('new Promise(() => {})'), QuickJSTimeoutException::class, 'external wait obeys timeoutMs');
 ok((hrtime(true) - $start) / 1e6 < 1000, 'deadline wakes a Promise without external events');
 eq(3, $limited->eval('1 + 2'), 'engine recovers after an external wait timeout');
-eq([], Revolt\EventLoop::getIdentifiers(), 'timeout leaves no timer behind');
+eq([], array_values(array_filter(Revolt\EventLoop::getIdentifiers(), Revolt\EventLoop::isReferenced(...))), 'timeout leaves no referenced watcher');
 throws(fn() => Amp\async(fn() => $limited->eval('new Promise(() => {})'))->await(), QuickJSTimeoutException::class, 'deadline wakes an Amp Fiber too');
 eq(3, $limited->eval('1 + 2'), 'engine recovers after an Amp Fiber timeout');
 

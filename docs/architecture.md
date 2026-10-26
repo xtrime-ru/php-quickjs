@@ -117,15 +117,18 @@ nested function requests, preventing PHP -> JS -> PHP deadlocks. A depth cap of
 200 and inherited deadlines bound recursion. Isolated runtimes cancel remaining
 callback requests before releasing their context.
 
-`engine.rs` owns PHP dispatch and Revolt suspensions. A notification socket wakes
-waiting Fibers; host callbacks run on the calling PHP thread and may suspend.
+`engine.rs` shares one wait loop for RPC results and native message batches. A
+coalesced descriptor notification dispatches results to their waiting Fibers;
+host callbacks run on the calling PHP thread and may suspend. Manifest updates
+are sent only when registrations change, and a cached facade is reused in JS.
 Without an autoloaded Revolt driver, synchronous requests use a blocking receive
 loop and unresolved external waits fail clearly. See [asynchronous execution](async.md).
 
 The cached facade and pending Promise roots are explicitly released before
 context teardown, including panic unwinding, so native closure cycles cannot
-retain a dead runtime. `close()` interrupts and joins the worker, then releases
-PHP capabilities and handles. The engine validates its creator PID on entry.
+retain a dead runtime. `close()` interrupts and joins the worker, wakes every
+waiter, then releases PHP capabilities and handles. User cleanup cannot prevent
+those wakeups. The engine validates its creator PID on entry.
 
 ## Capability handles
 

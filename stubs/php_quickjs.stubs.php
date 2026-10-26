@@ -61,6 +61,8 @@ class QuickJS
      * @return list<mixed>
      */
     public function drainMessages(): mixed {}
+    /** Await a message batch and enable automatic jobs; one consumer, non-isolated runtime. */
+    public function awaitMessages(): mixed {}
 
     /** Generate TypeScript `.d.ts` declarations for the `php` and `quickjs` globals. */
     public function dts(): string {}
@@ -94,6 +96,8 @@ namespace Js {
 
         /** Invoke the JS function, awaiting a returned Promise. */
         public function call(mixed ...$args): mixed {}
+        /** Queue a bounded call; discard its value, deliver failures to awaitMessages(). */
+        public function post(mixed ...$args): void {}
     }
 }
 

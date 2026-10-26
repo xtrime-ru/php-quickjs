@@ -109,4 +109,73 @@ if (function_exists('pcntl_fork')) {
     eq(42, $parent->eval('42', false), 'parent worker survives child exit');
     $parent->close();
 }
+$messages = new QuickJS();
+$clock = $messages->eval('[quickjs.now(), quickjs.now()]', false);
+ok($clock[0] >= 0 && $clock[1] >= $clock[0], 'native clock is monotonic');
+$batch = Amp\async(static fn() => $messages->awaitMessages());
+Amp\delay(.001);
+throws(fn() => $messages->awaitMessages(), Throwable::class, 'message pump rejects multiple consumers');
+$messages->eval('Promise.resolve().then(() => quickjs.postMessage(42)); null', false);
+eq([42], $batch->await(), 'message pump drives ready jobs without a JS drain callback');
+$batch = Amp\async(static fn() => $messages->awaitMessages());
+Amp\delay(.001);
+$messages->close();
+throws(fn() => $batch->await(), Throwable::class, 'close resumes a message consumer');
+
+$timedMessages = new QuickJS(timeoutMs: 20);
+$batch = Amp\async(static fn() => $timedMessages->awaitMessages());
+Amp\delay(.001);
+$timedMessages->eval('Promise.resolve().then(() => { while(true) {} }); null', false);
+throws(fn() => $batch->await(), QuickJSTimeoutException::class, 'automatic job turns retain the configured execution budget');
+eq(42, $timedMessages->eval('42', false), 'runtime recovers after an automatic job timeout');
+$timedMessages->close();
+
+$hostJobs = new QuickJS();
+$hostJobs->register('reenter', static function () use ($hostJobs) {
+    try { $hostJobs->eval('42', false); }
+    catch (Throwable $error) { return $error->getMessage(); }
+    return 'incorrectly accepted';
+});
+$batch = Amp\async(static fn() => $hostJobs->awaitMessages());
+Amp\delay(.001);
+$hostJobs->eval('Promise.resolve().then(() => quickjs.postMessage(php.reenter())); null', false);
+ok(str_contains($batch->await()[0], 'Cannot eval'), 'PHP host calls from automatic jobs retain the reentry guard');
+$hostJobs->close();
+
+$posted = new QuickJS();
+$push = $posted->eval('value => { quickjs.postMessage(value); }', false);
+for ($i = 0; $i < 512; ++$i) $push->post($i);
+$values = [];
+while (count($values) < 512) array_push($values, ...$posted->awaitMessages());
+eq(range(0, 511), $values, 'bounded posts preserve FIFO and make progress under admission pressure');
+$posted->close();
+
+$postedError = new QuickJS();
+$explode = $postedError->eval('async () => { throw new Error("posted failure"); }', false);
+$explode->post();
+try { $postedError->awaitMessages(); ok(false, 'posted errors must surface'); }
+catch (Throwable $error) { ok(str_contains($error->getMessage(), 'posted failure'), 'posted rejection reaches the message consumer'); }
+$postedError->close();
+
+foreach (['throw', 'reenter'] as $cleanup) {
+    $closing = new QuickJS();
+    $never = $closing->eval('() => new Promise(() => {})', false);
+    $resource = new class($closing, $cleanup) {
+        public function __construct(private QuickJS $js, private string $cleanup) {}
+        public function __destruct() {
+            if ($this->cleanup === 'reenter') $this->js->grant(new stdClass());
+            throw new RuntimeException('cleanup failed');
+        }
+    };
+    $closing->grant($resource);
+    unset($resource);
+    $waiters = [Amp\async(static fn() => $never()), Amp\async(static fn() => $never())];
+    Amp\delay(.005);
+    throws(fn() => $closing->close(), Throwable::class, "$cleanup during close propagates cleanup failure");
+    Amp\delay(.001);
+    foreach ($waiters as $waiter) {
+        ok($waiter->isComplete(), "$cleanup during close resumes every waiter");
+        throws(fn() => $waiter->await(), Throwable::class, "$cleanup during close rejects without deadlock");
+    }
+}
 done();

@@ -27,6 +27,7 @@ impl JsCallback {
     }
     fn invoke_inner(&self, args: &[&Zval]) -> PhpResult<Zval> {
         self.check_realm().map_err(PhpException::from_message)?;
+        self.engine.ensure_open()?;
         let _guard = self.engine.enter().map_err(PhpException::from_message)?;
         let args =
             arguments_to_middle(args, &self.engine.state).map_err(PhpException::from_message)?;
@@ -47,5 +48,14 @@ impl JsCallback {
     }
     pub fn call(&self, args: &[&Zval]) -> PhpResult<Zval> {
         self.invoke_inner(args)
+    }
+    /// Queue a call, discard its value and report failures to awaitMessages().
+    /// Admission is bounded and yields through Revolt when the queue is full.
+    pub fn post(&self, args: &[&Zval]) -> PhpResult<()> {
+        self.check_realm().map_err(PhpException::from_message)?;
+        self.engine.ensure_post_open()?;
+        let args =
+            arguments_to_middle(args, &self.engine.state).map_err(PhpException::from_message)?;
+        self.engine.post(self.id, args)
     }
 }

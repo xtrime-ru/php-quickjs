@@ -1,8 +1,9 @@
-//! Runtime ownership and RPC. This module never calls Zend or retains PHP values.
+//! Runtime ownership and RPC. Driver and Session retain only owned wire values;
+//! PHP exception conversion is called by the PHP-thread facade.
 use crate::{
     bridge::{build_facade, MessageQueue, RUNTIME_JS},
     error::{self, HostError, JsErrorParts},
-    marshal::{js_to_data, js_to_middle, middle_to_js, MiddleValue as Data},
+    marshal::{js_to_data, js_to_middle, middle_into_js, MiddleValue as Data},
     transpile::{TranspileCache, Transpiled},
 };
 use ext_php_rs::prelude::PhpException;
@@ -10,16 +11,43 @@ use rquickjs::{Context, Ctx, Exception, Function, Promise, Runtime, Value};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
+    fs::File,
     io::Write,
-    os::unix::net::UnixStream,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+#[cfg(target_os = "linux")]
+fn notification_pair() -> std::io::Result<(File, File)> {
+    use std::os::fd::FromRawFd;
+    unsafe extern "C" {
+        fn php_quickjs_notification_fd() -> i32;
+    }
+    let fd = unsafe { php_quickjs_notification_fd() };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The PHP thread owns the reader until after joining the writer's thread.
+    let reader = unsafe { File::from_raw_fd(fd) };
+    let writer = reader.try_clone()?;
+    Ok((reader, writer))
+}
+#[cfg(not(target_os = "linux"))]
+fn notification_pair() -> std::io::Result<(File, File)> {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    let (reader, writer) = UnixStream::pair()?;
+    reader.set_nonblocking(true)?;
+    writer.set_nonblocking(true)?;
+    Ok((
+        File::from(OwnedFd::from(reader)),
+        File::from(OwnedFd::from(writer)),
+    ))
+}
 
 pub struct Config {
     pub memory_limit: usize,
@@ -30,9 +58,28 @@ pub struct Config {
     pub cache_entries: usize,
     pub cache_bytes: usize,
 }
+// Each direction writes different counters. Keep them off one cache line.
+#[derive(Default)]
+#[repr(align(128))]
+struct Signal<T>(T);
+impl<T> std::ops::Deref for Signal<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+#[derive(Default)]
+struct Signals {
+    stop: Signal<AtomicBool>,
+    notified: Signal<AtomicBool>,
+    pump: Signal<AtomicBool>,
+    posts: Signal<AtomicUsize>,
+}
 pub enum Operation {
     Eval { code: String, typescript: bool },
     Callback { id: u64, args: Vec<Data> },
+    Post { id: u64, args: Vec<Data> },
+    Capacity,
     Jobs(i64),
     HasJobs,
     Roundtrip(Data),
@@ -40,7 +87,7 @@ pub enum Operation {
 pub struct Request {
     pub id: u64,
     pub op: Operation,
-    pub names: Vec<String>,
+    pub names: Option<Vec<String>>,
     pub deletions: Vec<u64>,
     pub parent: Option<u64>,
 }
@@ -49,6 +96,7 @@ pub enum HostTarget {
     Function(u64),
 }
 pub enum Command {
+    Pump,
     Request(Request),
     HostReply {
         token: u64,
@@ -61,6 +109,9 @@ pub enum Command {
     Stop,
 }
 pub enum Event {
+    Messages,
+    AsyncError(WireError),
+    Fatal(WireError),
     Done {
         id: u64,
         result: Result<Data, WireError>,
@@ -152,9 +203,9 @@ pub struct Port {
 pub struct PortInner {
     tx: mpsc::SyncSender<Command>,
     rx: mpsc::Receiver<Event>,
-    pub wake: UnixStream,
+    pub wake: File,
     worker: RefCell<Option<JoinHandle<()>>>,
-    stop: Arc<AtomicBool>,
+    signals: Arc<Signals>,
     messages: Arc<Mutex<MessageQueue>>,
 }
 impl std::ops::Deref for Port {
@@ -165,19 +216,14 @@ impl std::ops::Deref for Port {
 }
 impl Port {
     pub fn new(config: Config) -> Result<Self, WireError> {
-        let (wake, notify) = UnixStream::pair().map_err(|e| WireError::Internal(e.to_string()))?;
-        wake.set_nonblocking(true)
-            .map_err(|e| WireError::Internal(e.to_string()))?;
-        notify
-            .set_nonblocking(true)
-            .map_err(|e| WireError::Internal(e.to_string()))?;
+        let (wake, notify) = notification_pair().map_err(|e| WireError::Internal(e.to_string()))?;
         let (tx, commands) = mpsc::sync_channel(256);
         let (events, rx) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        let signals = Arc::new(Signals::default());
+        let worker_signals = signals.clone();
         let messages = Arc::new(Mutex::new(MessageQueue::new(
             config.max_queued_message_bytes,
         )));
-        let closed = stop.clone();
         let queue = messages.clone();
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
@@ -193,15 +239,16 @@ impl Port {
                     commands: RefCell::new(commands),
                     events,
                     notify,
-                    stop: closed.clone(),
+                    signals: worker_signals,
                     messages: queue,
                     cache: TranspileCache::new(config.cache_entries, config.cache_bytes),
                     config,
                     token: Cell::new(0),
+                    notification_pending: Cell::new(false),
                 });
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run(ready_tx)));
-                closed.store(true, Ordering::SeqCst);
+                driver.signals.stop.store(true, Ordering::SeqCst);
                 if !matches!(outcome, Ok(Ok(()))) {
                     driver.emit(Event::Stopped(
                         "QuickJS worker terminated unexpectedly".into(),
@@ -216,7 +263,7 @@ impl Port {
             ))
         });
         if let Err(error) = initialized {
-            stop.store(true, Ordering::SeqCst);
+            signals.stop.store(true, Ordering::SeqCst);
             let _ = tx.try_send(Command::Stop);
             let _ = worker.join();
             return Err(error);
@@ -227,7 +274,7 @@ impl Port {
                 rx,
                 wake,
                 worker: RefCell::new(Some(worker)),
-                stop,
+                signals,
                 messages,
             }),
             pid: std::process::id(),
@@ -243,7 +290,7 @@ impl Port {
     }
     pub fn check(&self) -> Result<(), WireError> {
         self.check_pid()?;
-        if self.stop.load(Ordering::SeqCst) {
+        if self.signals.stop.load(Ordering::SeqCst) {
             return Err(WireError::Internal("QuickJS worker is closed".into()));
         }
         Ok(())
@@ -256,6 +303,31 @@ impl Port {
     }
     pub fn receive(&self) -> Result<Event, mpsc::TryRecvError> {
         self.rx.try_recv()
+    }
+    pub fn acknowledge_notification(&self) {
+        // Clear before draining events: a concurrent enqueue either appears in
+        // this drain or writes another byte. Neither ordering loses a wakeup.
+        self.signals.notified.store(false, Ordering::SeqCst);
+    }
+    pub fn start_pump(&self) -> Result<(), WireError> {
+        self.check()?;
+        if !self.signals.pump.load(Ordering::SeqCst)
+            && !self.signals.pump.swap(true, Ordering::SeqCst)
+        {
+            self.send(Command::Pump)?;
+        }
+        Ok(())
+    }
+    pub fn reserve_post(&self) -> bool {
+        self.signals
+            .posts
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < 128).then_some(n + 1)
+            })
+            .is_ok()
+    }
+    pub fn release_post(&self) {
+        self.signals.posts.fetch_sub(1, Ordering::Relaxed);
     }
     pub fn receive_blocking(&self) -> Result<Event, WireError> {
         self.rx
@@ -274,7 +346,7 @@ impl Port {
         if self.pid != std::process::id() {
             return;
         }
-        self.stop.store(true, Ordering::SeqCst);
+        self.signals.stop.store(true, Ordering::SeqCst);
         let _ = self.tx.try_send(Command::Stop);
         if let Some(worker) = self.worker.borrow_mut().take() {
             let _ = worker.join();
@@ -297,27 +369,46 @@ impl Drop for Port {
 struct Driver {
     commands: RefCell<mpsc::Receiver<Command>>,
     events: mpsc::Sender<Event>,
-    notify: UnixStream,
-    stop: Arc<AtomicBool>,
+    notify: File,
+    signals: Arc<Signals>,
     messages: Arc<Mutex<MessageQueue>>,
     cache: TranspileCache,
     config: Config,
     token: Cell<u64>,
+    notification_pending: Cell<bool>,
 }
 impl Driver {
     fn notify(&self) {
-        let _ = (&self.notify).write(&[1]);
+        if !self.signals.notified.swap(true, Ordering::SeqCst) {
+            let _ = (&self.notify).write(&1u64.to_ne_bytes());
+        }
     }
     fn emit(&self, event: Event) {
+        if matches!(&event, Event::Fatal(_)) && self.signals.stop.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let urgent = !self.signals.pump.load(Ordering::SeqCst)
+            || matches!(
+                &event,
+                Event::Host { .. } | Event::Stopped(_) | Event::AsyncError(_) | Event::Fatal(_)
+            );
         let _ = self.events.send(event);
-        self.notify();
+        self.notification_pending.set(true);
+        if urgent {
+            self.flush_notifications();
+        }
+    }
+    fn flush_notifications(&self) {
+        if self.notification_pending.replace(false) {
+            self.notify();
+        }
     }
     fn run(self: &Rc<Self>, ready: mpsc::SyncSender<Result<(), WireError>>) -> Result<(), String> {
         if self.config.isolated {
             let _ = ready.send(Ok(()));
             loop {
                 let command = self.commands.borrow().recv().map_err(|e| e.to_string())?;
-                if self.stop.load(Ordering::SeqCst) {
+                if self.signals.stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
                 match command {
@@ -354,11 +445,11 @@ impl Driver {
         crate::sandbox::apply_limits(&rt, self.config.memory_limit, self.config.max_stack);
         let deadline = Rc::new(Cell::new(None::<Instant>));
         let timed_out = Rc::new(Cell::new(false));
-        let interrupted = self.stop.clone();
+        let interrupted = self.signals.clone();
         let dl = deadline.clone();
         let expired = timed_out.clone();
         rt.set_interrupt_handler(Some(Box::new(move || {
-            if interrupted.load(Ordering::SeqCst) {
+            if interrupted.stop.load(Ordering::SeqCst) {
                 return true;
             }
             if dl.get().is_some_and(|d| Instant::now() >= d) {
@@ -373,6 +464,8 @@ impl Driver {
             let session = Rc::new(Session {
                 driver: self.clone(),
                 pending: RefCell::new(Vec::new()),
+                posted: RefCell::new(HashSet::new()),
+                capacity: RefCell::new(VecDeque::new()),
                 replies: RefCell::new(HashMap::new()),
                 host_waits: RefCell::new(HashSet::new()),
                 entries: RefCell::new(Vec::new()),
@@ -383,6 +476,7 @@ impl Driver {
                 root_finished: Cell::new(false),
                 facade: RefCell::new(None),
                 js_depth: Cell::new(0),
+                reported_failure: Cell::new(false),
             });
             let _cleanup = SessionCleanup(session.clone());
             install(&ctx, session.clone()).map_err(|e| error::js_error_message(&ctx, e))?;
@@ -392,8 +486,43 @@ impl Driver {
             if let Some(first) = first {
                 session.request(&ctx, first);
             }
-            while !self.stop.load(Ordering::SeqCst) && !session.root_finished.get() {
-                session.advance(&ctx);
+            'running: while !self.signals.stop.load(Ordering::SeqCst)
+                && !session.root_finished.get()
+            {
+                let turn = (self.config.timeout_ms > 0
+                    && self.signals.pump.load(Ordering::SeqCst)
+                    && jobs_pending(&ctx))
+                .then(|| {
+                    let deadline = session.deadline.get().or_else(|| {
+                        (self.config.timeout_ms > 0)
+                            .then(|| Instant::now() + Duration::from_millis(self.config.timeout_ms))
+                    });
+                    session.enter(deadline, false)
+                });
+                // Drain runnable jobs, but admit PHP callbacks every 64 jobs so
+                // an unbounded microtask chain cannot starve external timers.
+                let mut jobs = 0;
+                loop {
+                    session.advance(&ctx);
+                    jobs += 1;
+                    if jobs % 64 == 0 {
+                        self.flush_notifications();
+                        let command = self.commands.borrow().try_recv().ok();
+                        if let Some(command) = command {
+                            if !session.command(&ctx, command) {
+                                break 'running;
+                            }
+                        }
+                    }
+                    if self.signals.stop.load(Ordering::SeqCst)
+                        || !session.has_awaitable()
+                        || !jobs_pending(&ctx)
+                    {
+                        break;
+                    }
+                }
+                drop(turn);
+                self.flush_notifications();
                 if session.root_finished.get() {
                     break;
                 }
@@ -424,7 +553,11 @@ impl Driver {
                 self.emit(Event::Done {
                     id: item.id,
                     result: Err(WireError::Internal(
-                        "JS callback canceled: owning isolated eval ended".into(),
+                        if self.signals.stop.load(Ordering::SeqCst) {
+                            "QuickJS worker is closed".into()
+                        } else {
+                            "JS callback canceled: owning isolated eval ended".into()
+                        },
                     )),
                 });
             }
@@ -450,6 +583,8 @@ struct Pending<'js> {
 struct Session<'js> {
     driver: Rc<Driver>,
     pending: RefCell<Vec<Pending<'js>>>,
+    posted: RefCell<HashSet<u64>>,
+    capacity: RefCell<VecDeque<(u64, Option<u64>)>>,
     replies: RefCell<HashMap<u64, Result<Data, HostError>>>,
     host_waits: RefCell<HashSet<u64>>,
     entries: RefCell<Vec<Option<Instant>>>,
@@ -458,12 +593,29 @@ struct Session<'js> {
     failed: RefCell<VecDeque<u64>>,
     root: Option<u64>,
     root_finished: Cell<bool>,
-    facade: RefCell<Option<(Vec<String>, rquickjs::Object<'js>)>>,
+    facade: RefCell<Option<rquickjs::Object<'js>>>,
     js_depth: Cell<usize>,
+    reported_failure: Cell<bool>,
 }
 // Native closures retain Session. Break its JS roots before the context is freed,
 // including panic unwinding; otherwise a cached facade could retain the runtime.
 struct SessionCleanup<'js>(Rc<Session<'js>>);
+struct JsEntry<'a, 'js> {
+    session: &'a Session<'js>,
+    depth: bool,
+    budget: bool,
+}
+impl Drop for JsEntry<'_, '_> {
+    fn drop(&mut self) {
+        if self.depth {
+            self.session.js_depth.set(self.session.js_depth.get() - 1);
+        }
+        if self.budget {
+            self.session.entries.borrow_mut().pop();
+            self.session.update_deadline();
+        }
+    }
+}
 impl Drop for SessionCleanup<'_> {
     fn drop(&mut self) {
         self.0.pending.borrow_mut().clear();
@@ -474,7 +626,43 @@ fn jobs_pending(ctx: &Ctx<'_>) -> bool {
     unsafe { rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr())) }
 }
 impl<'js> Session<'js> {
+    fn enter(&self, deadline: Option<Instant>, depth: bool) -> JsEntry<'_, 'js> {
+        let budget = self.driver.config.timeout_ms > 0;
+        if budget {
+            self.entries.borrow_mut().push(deadline);
+            self.update_deadline();
+        }
+        if depth {
+            self.js_depth.set(self.js_depth.get() + 1);
+        }
+        JsEntry {
+            session: self,
+            depth,
+            budget,
+        }
+    }
+    fn finish_value(
+        &self,
+        id: u64,
+        ctx: &Ctx<'js>,
+        result: rquickjs::Result<Value<'js>>,
+        context: &ErrorContext,
+    ) {
+        let result = result
+            .and_then(|value| {
+                if self.posted.borrow().contains(&id) {
+                    Ok(Data::Null)
+                } else {
+                    js_to_middle(ctx, value)
+                }
+            })
+            .map_err(|e| self.error(ctx, e, context));
+        self.finish(id, result);
+    }
     fn update_deadline(&self) {
+        if self.driver.config.timeout_ms == 0 {
+            return;
+        }
         let entries = self.entries.borrow();
         // An independent pending Promise must not shorten a new synchronous entry.
         // Awaited jobs inherit their own active budget through the entry stack.
@@ -520,22 +708,49 @@ impl<'js> Session<'js> {
                     true
                 }
             });
+            self.capacity.borrow_mut().retain(|(child, parent)| {
+                if *parent == Some(id) {
+                    canceled.push(*child);
+                    false
+                } else {
+                    true
+                }
+            });
             for id in canceled {
-                self.driver.emit(Event::Done {
+                self.finish(
                     id,
-                    result: Err(WireError::Internal(
+                    Err(WireError::Internal(
                         "JS callback canceled: owning call ended".into(),
                     )),
-                });
+                );
             }
         }
-        self.driver.emit(Event::Done { id, result });
+        let posted = self.posted.borrow_mut().remove(&id);
+        if posted {
+            self.driver.signals.posts.fetch_sub(1, Ordering::Relaxed);
+            if let Err(error) = result {
+                self.driver.emit(Event::Fatal(error));
+            }
+            let available =
+                128usize.saturating_sub(self.driver.signals.posts.load(Ordering::Relaxed));
+            let ready = {
+                let mut capacity = self.capacity.borrow_mut();
+                let n = available.min(capacity.len());
+                capacity.drain(..n).map(|(id, _)| id).collect::<Vec<_>>()
+            };
+            for id in ready {
+                self.finish(id, Ok(Data::Null));
+            }
+        } else {
+            self.driver.emit(Event::Done { id, result });
+        }
         if self.root == Some(id) {
             self.root_finished.set(true)
         }
     }
     fn command(&self, ctx: &Ctx<'js>, command: Command) -> bool {
         match command {
+            Command::Pump => {}
             Command::Stop => return false,
             Command::Request(request) => self.request(ctx, request),
             Command::HostReply { token, result } => {
@@ -559,6 +774,9 @@ impl<'js> Session<'js> {
             deletions,
             parent,
         } = request;
+        if matches!(&op, Operation::Post { .. }) {
+            self.posted.borrow_mut().insert(id);
+        }
         if parent.is_some_and(|p| self.failed.borrow().contains(&p)) {
             self.finish(
                 id,
@@ -568,20 +786,31 @@ impl<'js> Session<'js> {
             );
             return;
         }
-        let inherited = self
-            .entries
-            .borrow()
-            .iter()
-            .copied()
-            .flatten()
-            .chain(
-                self.pending
-                    .borrow()
-                    .iter()
-                    .filter(|p| Some(p.id) == parent)
-                    .filter_map(|p| p.deadline),
-            )
-            .min();
+        if matches!(&op, Operation::Capacity) {
+            if self.driver.signals.posts.load(Ordering::Relaxed) < 128 {
+                self.finish(id, Ok(Data::Null));
+            } else {
+                self.capacity.borrow_mut().push_back((id, parent));
+            }
+            return;
+        }
+        let inherited = if self.driver.config.timeout_ms == 0 {
+            None
+        } else {
+            self.entries
+                .borrow()
+                .iter()
+                .copied()
+                .flatten()
+                .chain(
+                    self.pending
+                        .borrow()
+                        .iter()
+                        .filter(|p| Some(p.id) == parent)
+                        .filter_map(|p| p.deadline),
+                )
+                .min()
+        };
         let deadline = inherited.or_else(|| {
             (self.driver.config.timeout_ms > 0)
                 .then(|| Instant::now() + Duration::from_millis(self.driver.config.timeout_ms))
@@ -590,7 +819,7 @@ impl<'js> Session<'js> {
             self.finish(id, Err(WireError::Timeout));
             return;
         }
-        if self.entries.borrow().len() >= crate::engine::MAX_DEPTH {
+        if self.js_depth.get() >= crate::engine::MAX_DEPTH {
             self.finish(
                 id,
                 Err(WireError::Internal(
@@ -599,72 +828,60 @@ impl<'js> Session<'js> {
             );
             return;
         }
-        self.entries.borrow_mut().push(deadline);
-        self.update_deadline();
+        let _entry = self.enter(deadline, true);
         self.timed_out.set(false);
-        let await_result = matches!(&op, Operation::Eval { .. } | Operation::Callback { .. });
+        let await_result = matches!(
+            &op,
+            Operation::Eval { .. } | Operation::Callback { .. } | Operation::Post { .. }
+        );
         let context = ErrorContext {
             eval: matches!(&op, Operation::Eval { .. }),
             module: None,
         };
-        self.js_depth.set(self.js_depth.get() + 1);
-        let result = self.start(ctx, op, &names, &deletions, context);
-        match result {
-            Ok((value, context)) => {
-                if self.timed_out.get() || deadline.is_some_and(|d| Instant::now() >= d) {
-                    self.timed_out.set(false);
-                    self.finish(id, Err(WireError::Timeout));
-                } else if !await_result {
-                    self.finish(
-                        id,
-                        js_to_middle(ctx, value).map_err(|e| self.error(ctx, e, &context)),
-                    );
-                } else {
-                    let promise_result = (|| {
-                        if let Some(promise) = value.as_promise() {
-                            return Ok(Some(promise.clone()));
-                        }
+        let (value, context) = match self.start(ctx, op, names, &deletions, context) {
+            Ok(result) => result,
+            Err(error) => return self.finish(id, Err(error)),
+        };
+        if self.timed_out.replace(false) || deadline.is_some_and(|d| Instant::now() >= d) {
+            return self.finish(id, Err(WireError::Timeout));
+        }
+        let result = (|| {
+            if await_result {
+                let promise = match value.as_promise() {
+                    Some(promise) => Some(promise.clone()),
+                    None if value.is_object() => {
                         let normalize: Function = ctx.globals().get("__asPromise")?;
-                        normalize.call((value.clone(),))
-                    })();
-                    match promise_result {
-                        Err(e) => self.finish(id, Err(self.error(ctx, e, &context))),
-                        Ok(Some(promise)) => {
-                            if let Some(result) = promise.result::<Value>() {
-                                let result = result
-                                    .and_then(|v| js_to_middle(ctx, v))
-                                    .map_err(|e| self.error(ctx, e, &context));
-                                self.finish(id, result)
-                            } else {
-                                self.pending.borrow_mut().push(Pending {
-                                    id,
-                                    parent,
-                                    promise,
-                                    context,
-                                    deadline,
-                                    asked: false,
-                                    settle_depth: self.js_depth.get() - 1,
-                                })
-                            }
-                        }
-                        Ok(None) => self.finish(
-                            id,
-                            js_to_middle(ctx, value).map_err(|e| self.error(ctx, e, &context)),
-                        ),
+                        normalize.call((value.clone(),))?
                     }
+                    None => None,
+                };
+                if let Some(promise) = promise {
+                    if let Some(result) = promise.result::<Value>() {
+                        return result.map(Some);
+                    }
+                    self.pending.borrow_mut().push(Pending {
+                        id,
+                        parent,
+                        promise,
+                        context: context.clone(),
+                        deadline,
+                        asked: false,
+                        settle_depth: self.js_depth.get() - 1,
+                    });
+                    return Ok(None);
                 }
             }
-            Err(e) => self.finish(id, Err(e)),
+            Ok(Some(value))
+        })();
+        if let Some(result) = result.transpose() {
+            self.finish_value(id, ctx, result, &context);
         }
-        self.js_depth.set(self.js_depth.get() - 1);
-        self.entries.borrow_mut().pop();
-        self.update_deadline();
     }
     fn start(
         &self,
         ctx: &Ctx<'js>,
         op: Operation,
-        names: &[String],
+        names: Option<Vec<String>>,
         deletions: &[u64],
         mut context: ErrorContext,
     ) -> Result<(Value<'js>, ErrorContext), WireError> {
@@ -675,18 +892,22 @@ impl<'js> Session<'js> {
                     delete.call::<_, ()>((*id as f64,))?;
                 }
             }
+            if names.is_none() && !matches!(&op, Operation::Eval { .. }) {
+                return Ok(());
+            }
             let cached = self
                 .facade
                 .borrow()
                 .as_ref()
-                .filter(|(current, _)| current == names)
-                .map(|(_, object)| object.clone());
+                .filter(|_| names.is_none())
+                .cloned();
             if let Some(object) = cached {
                 ctx.globals().set("php", object)?;
             } else {
-                ctx.eval::<(), _>(build_facade(names))?;
+                let names = names.unwrap_or_default();
+                ctx.eval::<(), _>(build_facade(&names))?;
                 let object = ctx.globals().get("php")?;
-                *self.facade.borrow_mut() = Some((names.to_vec(), object));
+                *self.facade.borrow_mut() = Some(object);
             }
             Ok(())
         })();
@@ -715,25 +936,17 @@ impl<'js> Session<'js> {
                 ctx.eval_with_options(module.js.as_bytes(), options)
                     .map_err(|e| self.error(ctx, e, &context))?
             }
-            Operation::Callback { id, args } => {
-                let get: Function = ctx
-                    .globals()
-                    .get("__getJsFn")
-                    .map_err(|e| self.error(ctx, e, &context))?;
-                let function: Function = get
-                    .call((id as f64,))
-                    .map_err(|e| self.error(ctx, e, &context))?;
-                let mut call_args = rquickjs::function::Args::new(ctx.clone(), args.len());
-                for arg in args {
-                    call_args
-                        .push_arg(
-                            middle_to_js(ctx, &arg).map_err(|e| self.error(ctx, e, &context))?,
-                        )
-                        .map_err(|e| self.error(ctx, e, &context))?;
-                }
-                function
-                    .call_arg(call_args)
-                    .map_err(|e| self.error(ctx, e, &context))?
+            Operation::Callback { id, args } | Operation::Post { id, args } => {
+                let result = (|| {
+                    let get: Function = ctx.globals().get("__getJsFn")?;
+                    let function: Function = get.call((id as f64,))?;
+                    let mut call_args = rquickjs::function::Args::new(ctx.clone(), args.len());
+                    for arg in args {
+                        call_args.push_arg(middle_into_js(ctx, arg)?)?;
+                    }
+                    function.call_arg(call_args)
+                })();
+                result.map_err(|e| self.error(ctx, e, &context))?
             }
             Operation::Jobs(max) => {
                 let mut n = 0;
@@ -750,26 +963,23 @@ impl<'js> Session<'js> {
                 Value::new_float(ctx.clone(), n as f64)
             }
             Operation::HasJobs => Value::new_bool(ctx.clone(), jobs_pending(ctx)),
+            Operation::Capacity => unreachable!("capacity requests do not enter JS"),
             Operation::Roundtrip(value) => {
-                middle_to_js(ctx, &value).map_err(|e| self.error(ctx, e, &context))?
+                middle_into_js(ctx, value).map_err(|e| self.error(ctx, e, &context))?
             }
         };
         Ok((value, context))
     }
     fn job(&self, ctx: &Ctx<'js>, context: &ErrorContext) -> Result<bool, WireError> {
         let mut job_ctx = std::ptr::null_mut();
-        self.entries.borrow_mut().push(self.deadline.get());
-        self.update_deadline();
-        self.js_depth.set(self.js_depth.get() + 1);
+        let entry = self.enter(self.deadline.get(), true);
         let result = unsafe {
             rquickjs::qjs::JS_ExecutePendingJob(
                 rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()),
                 &mut job_ctx,
             )
         };
-        self.js_depth.set(self.js_depth.get() - 1);
-        self.entries.borrow_mut().pop();
-        self.update_deadline();
+        drop(entry);
         if result < 0 {
             return Err(self.error(ctx, rquickjs::Error::Exception, context));
         }
@@ -790,24 +1000,26 @@ impl<'js> Session<'js> {
             };
             let Some(index) = item else { break };
             let item = self.pending.borrow_mut().remove(index);
-            let result = if item.deadline.is_some_and(|d| Instant::now() >= d) {
-                Err(WireError::Timeout)
+            if item.deadline.is_some_and(|d| Instant::now() >= d) {
+                self.finish(item.id, Err(WireError::Timeout));
             } else {
-                item.promise
-                    .result::<Value>()
-                    .unwrap()
-                    .and_then(|v| js_to_middle(ctx, v))
-                    .map_err(|e| self.error(ctx, e, &item.context))
-            };
-            self.finish(item.id, result);
+                self.finish_value(
+                    item.id,
+                    ctx,
+                    item.promise.result::<Value>().unwrap(),
+                    &item.context,
+                );
+            }
             self.update_deadline();
         }
     }
     fn has_awaitable(&self) -> bool {
-        self.pending
-            .borrow()
-            .iter()
-            .any(|p| p.settle_depth >= self.js_depth.get())
+        self.driver.signals.pump.load(Ordering::SeqCst)
+            || self
+                .pending
+                .borrow()
+                .iter()
+                .any(|p| p.settle_depth >= self.js_depth.get())
     }
     fn advance(&self, ctx: &Ctx<'js>) {
         self.settle(ctx);
@@ -817,36 +1029,30 @@ impl<'js> Session<'js> {
             .iter()
             .find(|p| p.settle_depth >= self.js_depth.get())
             .map(|p| (p.id, p.context.clone()));
-        let Some((id, context)) = target else {
-            return;
+        let (id, context) = match target {
+            Some((id, context)) => (Some(id), context),
+            None if self.driver.signals.pump.load(Ordering::SeqCst) => {
+                (None, ErrorContext::default())
+            }
+            None => return,
         };
         if let Err(e) = self.job(ctx, &context) {
-            let index = self.pending.borrow().iter().position(|p| p.id == id);
+            let index = self.pending.borrow().iter().position(|p| Some(p.id) == id);
             if let Some(index) = index {
                 self.pending.borrow_mut().remove(index);
-                self.finish(id, Err(e));
+                self.finish(id.unwrap(), Err(e));
                 self.update_deadline();
+            } else {
+                self.driver.signals.pump.store(false, Ordering::SeqCst);
+                self.driver.emit(Event::AsyncError(e));
             }
         }
         self.settle(ctx);
     }
     fn ask_loop(&self) {
-        let ids = {
-            let mut pending = self.pending.borrow_mut();
-            pending
-                .iter_mut()
-                .filter_map(|p| {
-                    if !p.asked {
-                        p.asked = true;
-                        Some(p.id)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        for id in ids {
-            self.driver.emit(Event::NeedsLoop { id })
+        for pending in self.pending.borrow_mut().iter_mut().filter(|p| !p.asked) {
+            pending.asked = true;
+            self.driver.emit(Event::NeedsLoop { id: pending.id });
         }
     }
     fn host(
@@ -871,7 +1077,7 @@ impl<'js> Session<'js> {
             args,
         });
         let result = (|| loop {
-            if self.driver.stop.load(Ordering::SeqCst) {
+            if self.driver.signals.stop.load(Ordering::SeqCst) {
                 return Err(Exception::throw_internal(ctx, "QuickJS worker closed"));
             }
             if self.deadline.get().is_some_and(|d| Instant::now() >= d) {
@@ -884,11 +1090,12 @@ impl<'js> Session<'js> {
             let reply = self.replies.borrow_mut().remove(&token);
             if let Some(reply) = reply {
                 return match reply {
-                    Ok(value) => middle_to_js(ctx, &value),
+                    Ok(value) => middle_into_js(ctx, value),
                     Err(error) => Err(error::throw_host_error(ctx, &error)),
                 };
             }
             self.advance(ctx);
+            self.driver.flush_notifications();
             let command = if jobs_pending(ctx) && self.has_awaitable() {
                 self.driver.commands.borrow().try_recv().ok()
             } else {
@@ -931,20 +1138,49 @@ fn install<'js>(ctx: &Ctx<'js>, session: Rc<Session<'js>>) -> rquickjs::Result<(
         },
     )?;
     ctx.globals().set("__php_invoke", invoke)?;
-    let queue = session.driver.messages.clone();
+    let message_driver = session.driver.clone();
     let post = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, value: Value<'js>| -> rquickjs::Result<()> {
+            let queue = &message_driver.messages;
             let capacity = queue.lock().unwrap_or_else(|e| e.into_inner()).remaining();
             let (data, bytes) = js_to_data(&ctx, value, capacity)?;
+            let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+            let empty = queue.is_empty();
             queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .push(data, bytes)
-                .map_err(|e| Exception::throw_type(&ctx, e))
+                .map_err(|e| Exception::throw_type(&ctx, e))?;
+            drop(queue);
+            if empty && message_driver.signals.pump.load(Ordering::SeqCst) {
+                message_driver.emit(Event::Messages);
+            }
+            Ok(())
         },
     )?;
     let quickjs = rquickjs::Object::new(ctx.clone())?;
+    let failure_session = session.clone();
+    quickjs.set(
+        "reportError",
+        Function::new(ctx.clone(), move |ctx: Ctx<'js>, value: Value<'js>| {
+            if !failure_session.reported_failure.replace(true) {
+                let thrown = ctx.throw(value);
+                let parts = error::js_error_parts(&ctx, thrown);
+                failure_session.driver.emit(Event::Fatal(WireError::Guest {
+                    parts,
+                    module: None,
+                    map: None,
+                    eval: false,
+                }));
+            }
+        })?,
+    )?;
+    let clock_origin = Instant::now();
+    quickjs.set(
+        "now",
+        Function::new(ctx.clone(), move || {
+            clock_origin.elapsed().as_secs_f64() * 1000.0
+        })?,
+    )?;
     quickjs.set("postMessage", post)?;
     ctx.globals().set("quickjs", quickjs)?;
     ctx.eval::<(),_>("Object.freeze(globalThis.quickjs); Object.defineProperty(globalThis,'quickjs',{value:quickjs,writable:false,configurable:false})")?;

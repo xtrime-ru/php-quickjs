@@ -10,8 +10,9 @@ until `executePendingJobs()` or a returned Promise requires them.
 ## PHP scheduling
 
 Autoload `revolt/event-loop` to suspend the calling PHP Fiber during JS execution.
-A nonblocking Unix notification socket wakes Revolt for completed requests and
-PHP capability calls. The watcher is removed when no PHP callers remain. Without
+A native descriptor wakes only the PHP callers whose results are ready. Linux
+uses eventfd; macOS uses a socket pair. PHP streams wrap the descriptor directly,
+so CGI and FPM are supported too. The watcher is unreferenced while idle. Without
 Revolt, simple synchronous calls use a blocking receive loop on the PHP thread;
 external Promise waits fail with an explicit autoload error. Guest code still
 runs on its worker in both cases.
@@ -44,7 +45,7 @@ owning runtime until released or explicitly closed. PHP Future cancellation
 alone does not call `close()`; consumers decide whether to abort the whole runtime.
 
 Close live runtimes before `fork()`, then create new runtimes in the child. An inherited runtime cannot be used in a child.
-Linux and macOS are supported; notification sockets use `php://fd`.
+Linux and macOS are supported.
 
 ## Native messages
 
@@ -52,6 +53,16 @@ Linux and macOS are supported; notification sockets use `php://fd`.
 `Uint8Array`, arrays and records. Functions, symbols, cycles and nesting beyond
 64 levels are rejected. The `quickjs` global and method are frozen. PHP retrieves
 and clears messages with `$js->drainMessages()` without entering JS.
+
+`$js->awaitMessages()` opts a shared runtime into automatic job processing and
+waits for a nonempty batch, yielding through Revolt. Use one message consumer per
+runtime. `Js\Callback::post(...$args)` queues a call without awaiting its result;
+admission is bounded to 128 outstanding calls and yields when full. A posted
+call failure stops the worker and reaches the message consumer. Synchronous
+`__invoke()` and `call()` keep their existing result and exception semantics.
+
+Guest bridges can use `quickjs.now()` for monotonic milliseconds and
+`quickjs.reportError(error)` to stop the worker on a background failure.
 
 The shared native queue has an aggregate accounted-byte limit, 32 MiB by default,
 configured through `maxQueuedMessageBytes`. Accounting includes containers and
