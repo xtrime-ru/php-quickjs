@@ -110,4 +110,19 @@ $isolated->register('startPending', static function ($callback, $resolve) use (&
 eq(8, $isolated->eval('new Promise(resolve => php.startPending(() => new Promise(() => {}), resolve))'), 'isolated owner finishes with a callback Promise pending');
 throws(fn() => $future->await(), Exception::class, 'isolated entry cancels and releases pending callback');
 eq(42, $isolated->eval('(async () => { await 0; return 42; })()'), 'new isolated runtime works after pending callback cleanup');
+// A pending Promise and a posted call must not interfere with synchronous reentry.
+$mixed = new QuickJS(timeoutMs: 1000);
+$mixed->register('map', static fn(array $values, callable $callback) => array_map($callback, $values));
+$wait = $mixed->eval('() => new Promise(resolve => { globalThis.finishMixed = resolve; })', false);
+$pushMixed = $mixed->eval('async value => { await 0; quickjs.postMessage(value); }', false);
+$runMixed = $mixed->eval('() => php.map([1, 2, 3], n => php.map([n, n + 1], m => m * 2))', false);
+$finishMixed = $mixed->eval('() => finishMixed(43)', false);
+$pendingMixed = Amp\async(static fn() => $wait());
+Amp\delay(.001);
+$pushMixed->post(7);
+eq([[2, 4], [4, 6], [6, 8]], $runMixed(), 'nested synchronous callbacks coexist with pending and posted calls');
+eq([7], $mixed->awaitMessages(), 'posted Promise delivers its message during mixed calls');
+$finishMixed();
+eq(43, $pendingMixed->await(), 'unrelated pending Promise completes after nested callbacks');
+$mixed->close();
 done();

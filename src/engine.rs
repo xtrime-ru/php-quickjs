@@ -176,7 +176,11 @@ impl Engine {
         self.request(Operation::Eval { code, typescript })
     }
     pub fn callback(&self, id: u64, args: Vec<MiddleValue>) -> PhpResult<Zval> {
-        self.request(Operation::Callback { id, args })
+        self.request(Operation::Call {
+            id,
+            args,
+            posted: false,
+        })
     }
     pub fn post(&self, function: u64, args: Vec<MiddleValue>) -> PhpResult<()> {
         if self.isolated {
@@ -204,7 +208,11 @@ impl Engine {
         let id = self.next_id();
         let result = self.submit(
             id,
-            Operation::Post { id: function, args },
+            Operation::Call {
+                id: function,
+                args,
+                posted: true,
+            },
             self.active_eval.get(),
         );
         if result.is_err() {

@@ -76,9 +76,15 @@ struct Signals {
     posts: Signal<AtomicUsize>,
 }
 pub enum Operation {
-    Eval { code: String, typescript: bool },
-    Callback { id: u64, args: Vec<Data> },
-    Post { id: u64, args: Vec<Data> },
+    Eval {
+        code: String,
+        typescript: bool,
+    },
+    Call {
+        id: u64,
+        args: Vec<Data>,
+        posted: bool,
+    },
     Capacity,
     Jobs(i64),
     HasJobs,
@@ -467,7 +473,6 @@ impl Driver {
                 posted: RefCell::new(HashSet::new()),
                 capacity: RefCell::new(VecDeque::new()),
                 replies: RefCell::new(HashMap::new()),
-                host_waits: RefCell::new(HashSet::new()),
                 entries: RefCell::new(Vec::new()),
                 deadline,
                 timed_out,
@@ -522,26 +527,16 @@ impl Driver {
                     }
                 }
                 drop(turn);
-                self.flush_notifications();
                 if session.root_finished.get() {
+                    self.flush_notifications();
                     break;
                 }
-                let command = if session.pending.borrow().is_empty() {
-                    self.commands.recv().ok()
-                } else if jobs_pending(&ctx) {
-                    self.commands.try_recv().ok()
-                } else {
+                let idle = session.pending.borrow().is_empty();
+                if !idle && !jobs_pending(&ctx) {
                     session.ask_loop();
-                    match self.commands.recv_timeout(Duration::from_millis(5)) {
-                        Ok(c) => Some(c),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(_) => break,
-                    }
-                };
-                if let Some(command) = command {
-                    if !session.command(&ctx, command) {
-                        break;
-                    }
+                }
+                if !session.step(&ctx, idle).unwrap_or(false) {
+                    break;
                 }
             }
             let pending = std::mem::take(&mut *session.pending.borrow_mut());
@@ -581,8 +576,7 @@ struct Session<'js> {
     pending: RefCell<Vec<Pending<'js>>>,
     posted: RefCell<HashSet<u64>>,
     capacity: RefCell<VecDeque<(u64, Option<u64>)>>,
-    replies: RefCell<HashMap<u64, Result<Data, HostError>>>,
-    host_waits: RefCell<HashSet<u64>>,
+    replies: RefCell<HashMap<u64, Option<Result<Data, HostError>>>>,
     entries: RefCell<Vec<Option<Instant>>>,
     deadline: Rc<Cell<Option<Instant>>>,
     timed_out: Rc<Cell<bool>>,
@@ -750,8 +744,8 @@ impl<'js> Session<'js> {
             Command::Stop => return false,
             Command::Request(request) => self.request(ctx, request),
             Command::HostReply { token, result } => {
-                if self.host_waits.borrow().contains(&token) {
-                    self.replies.borrow_mut().insert(token, result);
+                if let Some(reply) = self.replies.borrow_mut().get_mut(&token) {
+                    *reply = Some(result);
                 }
             }
             Command::Abort { id, message } => {
@@ -762,6 +756,21 @@ impl<'js> Session<'js> {
         }
         true
     }
+    fn step(&self, ctx: &Ctx<'js>, idle: bool) -> Result<bool, mpsc::RecvError> {
+        self.driver.flush_notifications();
+        let command = if !idle && jobs_pending(ctx) && self.has_awaitable() {
+            self.driver.commands.try_recv().ok()
+        } else if idle {
+            Some(self.driver.commands.recv()?)
+        } else {
+            match self.driver.commands.recv_timeout(Duration::from_millis(5)) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
+            }
+        };
+        Ok(command.is_none_or(|command| self.command(ctx, command)))
+    }
     fn request(&self, ctx: &Ctx<'js>, request: Request) {
         let Request {
             id,
@@ -770,7 +779,7 @@ impl<'js> Session<'js> {
             deletions,
             parent,
         } = request;
-        if matches!(&op, Operation::Post { .. }) {
+        if matches!(&op, Operation::Call { posted: true, .. }) {
             self.posted.borrow_mut().insert(id);
         }
         if parent.is_some_and(|p| self.failed.borrow().contains(&p)) {
@@ -826,10 +835,7 @@ impl<'js> Session<'js> {
         }
         let _entry = self.enter(deadline, true);
         self.timed_out.set(false);
-        let await_result = matches!(
-            &op,
-            Operation::Eval { .. } | Operation::Callback { .. } | Operation::Post { .. }
-        );
+        let await_result = matches!(&op, Operation::Eval { .. } | Operation::Call { .. });
         let context = ErrorContext {
             eval: matches!(&op, Operation::Eval { .. }),
             module: None,
@@ -932,7 +938,7 @@ impl<'js> Session<'js> {
                 ctx.eval_with_options(module.js.as_bytes(), options)
                     .map_err(|e| self.error(ctx, e, &context))?
             }
-            Operation::Callback { id, args } | Operation::Post { id, args } => {
+            Operation::Call { id, args, .. } => {
                 let result = (|| {
                     let get: Function = ctx.globals().get("__getJsFn")?;
                     let function: Function = get.call((id as f64,))?;
@@ -986,25 +992,27 @@ impl<'js> Session<'js> {
     }
     fn settle(&self, ctx: &Ctx<'js>) {
         loop {
-            let item = {
-                let pending = self.pending.borrow();
-                pending.iter().position(|p| {
-                    p.settle_depth >= self.js_depth.get()
-                        && (p.deadline.is_some_and(|d| Instant::now() >= d)
-                            || p.promise.result::<Value>().is_some())
-                })
-            };
-            let Some(index) = item else { break };
+            let ready = self
+                .pending
+                .borrow()
+                .iter()
+                .enumerate()
+                .find_map(|(index, p)| {
+                    if p.settle_depth < self.js_depth.get() {
+                        return None;
+                    }
+                    let result = if p.deadline.is_some_and(|d| Instant::now() >= d) {
+                        Err(WireError::Timeout)
+                    } else {
+                        Ok(p.promise.result::<Value>()?)
+                    };
+                    Some((index, result))
+                });
+            let Some((index, result)) = ready else { break };
             let item = self.pending.borrow_mut().remove(index);
-            if item.deadline.is_some_and(|d| Instant::now() >= d) {
-                self.finish(item.id, Err(WireError::Timeout));
-            } else {
-                self.finish_value(
-                    item.id,
-                    ctx,
-                    item.promise.result::<Value>().unwrap(),
-                    &item.context,
-                );
+            match result {
+                Ok(result) => self.finish_value(item.id, ctx, result, &item.context),
+                Err(error) => self.finish(item.id, Err(error)),
             }
             self.update_deadline();
         }
@@ -1066,7 +1074,7 @@ impl<'js> Session<'js> {
         };
         let token = self.driver.token.get() + 1;
         self.driver.token.set(token);
-        self.host_waits.borrow_mut().insert(token);
+        self.replies.borrow_mut().insert(token, None);
         self.driver.emit(Event::Host {
             token,
             target,
@@ -1083,7 +1091,11 @@ impl<'js> Session<'js> {
                     "JavaScript execution timed out",
                 ));
             }
-            let reply = self.replies.borrow_mut().remove(&token);
+            let reply = self
+                .replies
+                .borrow_mut()
+                .get_mut(&token)
+                .and_then(Option::take);
             if let Some(reply) = reply {
                 return match reply {
                     Ok(value) => middle_into_js(ctx, value),
@@ -1091,23 +1103,12 @@ impl<'js> Session<'js> {
                 };
             }
             self.advance(ctx);
-            self.driver.flush_notifications();
-            let command = if jobs_pending(ctx) && self.has_awaitable() {
-                self.driver.commands.try_recv().ok()
-            } else {
-                match self.driver.commands.recv_timeout(Duration::from_millis(5)) {
-                    Ok(c) => Some(c),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(_) => return Err(Exception::throw_internal(ctx, "PHP receiver closed")),
-                }
-            };
-            if let Some(command) = command {
-                if !self.command(ctx, command) {
-                    return Err(Exception::throw_internal(ctx, "QuickJS worker closed"));
-                }
+            match self.step(ctx, false) {
+                Ok(true) => {}
+                Ok(false) => return Err(Exception::throw_internal(ctx, "QuickJS worker closed")),
+                Err(_) => return Err(Exception::throw_internal(ctx, "PHP receiver closed")),
             }
         })();
-        self.host_waits.borrow_mut().remove(&token);
         self.replies.borrow_mut().remove(&token);
         result
     }
