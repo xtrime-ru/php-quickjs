@@ -207,44 +207,44 @@ impl<'js> JsConversion<'_, 'js> {
     }
 }
 
-/// Convert the neutral representation into a JS value.
-pub fn middle_to_js<'js>(ctx: &Ctx<'js>, value: &MiddleValue) -> rquickjs::Result<Value<'js>> {
+/// Convert owned values into JS, transferring binary buffers without copying.
+pub fn middle_into_js<'js>(ctx: &Ctx<'js>, value: MiddleValue) -> rquickjs::Result<Value<'js>> {
     Ok(match value {
         MiddleValue::Null => Value::new_null(ctx.clone()),
-        MiddleValue::Bool(b) => Value::new_bool(ctx.clone(), *b),
+        MiddleValue::Bool(b) => Value::new_bool(ctx.clone(), b),
         MiddleValue::Int(i) => {
-            if let Ok(i32v) = i32::try_from(*i) {
+            if let Ok(i32v) = i32::try_from(i) {
                 Value::new_int(ctx.clone(), i32v)
             } else {
                 // Beyond i32: represent as a JS number (exact up to 2^53).
-                Value::new_float(ctx.clone(), *i as f64)
+                Value::new_float(ctx.clone(), i as f64)
             }
         }
-        MiddleValue::Float(f) => Value::new_float(ctx.clone(), *f),
-        MiddleValue::Str(s) => rquickjs::String::from_str(ctx.clone(), s)?.into_value(),
-        MiddleValue::Bytes(b) => TypedArray::new_copy(ctx.clone(), b)?.into_value(),
+        MiddleValue::Float(f) => Value::new_float(ctx.clone(), f),
+        MiddleValue::Str(s) => rquickjs::String::from_str(ctx.clone(), &s)?.into_value(),
+        MiddleValue::Bytes(b) => TypedArray::new(ctx.clone(), b)?.into_value(),
         MiddleValue::Array(items) => {
             let arr = Array::new(ctx.clone())?;
-            for (i, it) in items.iter().enumerate() {
-                arr.set(i, middle_to_js(ctx, it)?)?;
+            for (i, it) in items.into_iter().enumerate() {
+                arr.set(i, middle_into_js(ctx, it)?)?;
             }
             arr.into_value()
         }
         MiddleValue::Map(entries) => {
             let obj = Object::new(ctx.clone())?;
             for (k, v) in entries {
-                obj.set(k.as_str(), middle_to_js(ctx, v)?)?;
+                obj.set(k, middle_into_js(ctx, v)?)?;
             }
             obj.into_value()
         }
         // Reconstruct callables from the JS-side helpers.
         MiddleValue::JsFn(id) => {
             let get: Function = ctx.globals().get("__getJsFn")?;
-            get.call((*id as f64,))?
+            get.call((id as f64,))?
         }
         MiddleValue::PhpFn(id) => {
             let make: Function = ctx.globals().get("__makePhpFn")?;
-            make.call((*id as f64,))?
+            make.call((id as f64,))?
         }
     })
 }
@@ -360,28 +360,6 @@ impl<'a> PhpConversion<'a> {
 impl Drop for PhpConversion<'_> {
     fn drop(&mut self) {
         self.state.release_php_fns(&self.registered);
-    }
-}
-
-/// Transfer owned buffers into QuickJS instead of cloning their backing Vec.
-pub fn middle_into_js<'js>(ctx: &Ctx<'js>, value: MiddleValue) -> rquickjs::Result<Value<'js>> {
-    match value {
-        MiddleValue::Bytes(bytes) => Ok(TypedArray::new(ctx.clone(), bytes)?.into_value()),
-        MiddleValue::Array(items) => {
-            let array = Array::new(ctx.clone())?;
-            for (index, item) in items.into_iter().enumerate() {
-                array.set(index, middle_into_js(ctx, item)?)?;
-            }
-            Ok(array.into_value())
-        }
-        MiddleValue::Map(entries) => {
-            let object = Object::new(ctx.clone())?;
-            for (key, value) in entries {
-                object.set(key, middle_into_js(ctx, value)?)?;
-            }
-            Ok(object.into_value())
-        }
-        value => middle_to_js(ctx, &value),
     }
 }
 

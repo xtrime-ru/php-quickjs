@@ -48,7 +48,7 @@ eq(42, $js->eval('
 '), 'JS function survives a round trip through PHP');
 
 // --- Mutual recursion / nesting (PHP -> JS -> PHP -> JS) -----------------
-$js->register('callTwice', fn(callable $fn, $x) => $fn($fn($x)));
+$js->register('callTwice', fn(Js\Callback $fn, $x) => $fn->call($fn($x)));
 eq(12, $js->eval('php.callTwice(n => php.makeAdder(3)(n), 6)'),
     'nested JS->PHP->JS->PHP callbacks');
 

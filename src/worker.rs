@@ -236,7 +236,7 @@ impl Port {
             )
             .spawn(move || {
                 let driver = Rc::new(Driver {
-                    commands: RefCell::new(commands),
+                    commands,
                     events,
                     notify,
                     signals: worker_signals,
@@ -367,7 +367,7 @@ impl Drop for Port {
     }
 }
 struct Driver {
-    commands: RefCell<mpsc::Receiver<Command>>,
+    commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
     notify: File,
     signals: Arc<Signals>,
@@ -407,7 +407,7 @@ impl Driver {
         if self.config.isolated {
             let _ = ready.send(Ok(()));
             loop {
-                let command = self.commands.borrow().recv().map_err(|e| e.to_string())?;
+                let command = self.commands.recv().map_err(|e| e.to_string())?;
                 if self.signals.stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -507,7 +507,7 @@ impl Driver {
                     jobs += 1;
                     if jobs % 64 == 0 {
                         self.flush_notifications();
-                        let command = self.commands.borrow().try_recv().ok();
+                        let command = self.commands.try_recv().ok();
                         if let Some(command) = command {
                             if !session.command(&ctx, command) {
                                 break 'running;
@@ -527,16 +527,12 @@ impl Driver {
                     break;
                 }
                 let command = if session.pending.borrow().is_empty() {
-                    self.commands.borrow().recv().ok()
+                    self.commands.recv().ok()
                 } else if jobs_pending(&ctx) {
-                    self.commands.borrow().try_recv().ok()
+                    self.commands.try_recv().ok()
                 } else {
                     session.ask_loop();
-                    match self
-                        .commands
-                        .borrow()
-                        .recv_timeout(Duration::from_millis(5))
-                    {
+                    match self.commands.recv_timeout(Duration::from_millis(5)) {
                         Ok(c) => Some(c),
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
                         Err(_) => break,
@@ -1097,14 +1093,9 @@ impl<'js> Session<'js> {
             self.advance(ctx);
             self.driver.flush_notifications();
             let command = if jobs_pending(ctx) && self.has_awaitable() {
-                self.driver.commands.borrow().try_recv().ok()
+                self.driver.commands.try_recv().ok()
             } else {
-                match self
-                    .driver
-                    .commands
-                    .borrow()
-                    .recv_timeout(Duration::from_millis(5))
-                {
+                match self.driver.commands.recv_timeout(Duration::from_millis(5)) {
                     Ok(c) => Some(c),
                     Err(mpsc::RecvTimeoutError::Timeout) => None,
                     Err(_) => return Err(Exception::throw_internal(ctx, "PHP receiver closed")),
