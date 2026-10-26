@@ -110,6 +110,18 @@ $isolated->register('startPending', static function ($callback, $resolve) use (&
 eq(8, $isolated->eval('new Promise(resolve => php.startPending(() => new Promise(() => {}), resolve))'), 'isolated owner finishes with a callback Promise pending');
 throws(fn() => $future->await(), Exception::class, 'isolated entry cancels and releases pending callback');
 eq(42, $isolated->eval('(async () => { await 0; return 42; })()'), 'new isolated runtime works after pending callback cleanup');
+// Polling a Promise future may itself enter PHP through an overridden then().
+$js->register('futureReentry', static fn(callable $callback) => $callback());
+eq(42, $js->eval('(() => {
+    const pending = new Promise(resolve => Promise.resolve().then(() => resolve(42)));
+    const then = pending.then;
+    pending.then = function (...args) {
+        php.futureReentry(async () => { await 0; return 7; });
+        return then.apply(this, args);
+    };
+    return pending;
+})()', false), 'Promise future polling permits nested asynchronous PHP callbacks');
+
 // A pending Promise and a posted call must not interfere with synchronous reentry.
 $mixed = new QuickJS(timeoutMs: 1000);
 $mixed->register('map', static fn(array $values, callable $callback) => array_map($callback, $values));

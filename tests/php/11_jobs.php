@@ -19,10 +19,10 @@ eq(42, $js->eval('let chain = Promise.resolve(42); for (let i = 0; i < 100; i++)
 eq(42, $js->eval('({ get then() { if (this.read) throw new Error("then read twice"); this.read = true; return resolve => resolve(42); } })'), 'thenable getter is read once');
 eq(42, (new QuickJS(isolated: true))->eval('(async () => { await 0; return 42; })()'), 'isolated eval awaits its Promise');
 $stop = new QuickJS();
-eq(42, $stop->eval('globalThis.detached = 0; Promise.resolve().then(() => { Promise.resolve().then(() => { detached = 1; }); return 42; })'), 'await stops when its Promise settles');
-eq(0, $stop->eval('detached'), 'await leaves later detached jobs queued');
+eq(42, $stop->eval('globalThis.detached = 0; Promise.resolve().then(() => { Promise.resolve().then(() => { detached = 1; }); return 42; })'), 'await returns its fulfilled Promise value');
+eq(1, $stop->eval('detached'), 'await may also drain later detached microtasks');
 $stop->executePendingJobs();
-eq(1, $stop->eval('detached'), 'detached jobs can still be drained explicitly');
+eq(1, $stop->eval('detached'), 'explicit drain remains valid after automatic microtasks');
 throws(fn() => (new QuickJS())->eval('new Promise(() => {})'), Throwable::class, 'external wait without autoloaded Revolt fails clearly');
 
 $js->eval('globalThis.answer = 0; Promise.resolve(21).then(n => { answer = n * 2; }); void 0;');

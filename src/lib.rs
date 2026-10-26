@@ -15,7 +15,6 @@ mod exceptions;
 mod handles;
 mod manifest;
 mod marshal;
-mod sandbox;
 mod transpile;
 mod worker;
 
