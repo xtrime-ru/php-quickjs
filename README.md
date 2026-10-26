@@ -15,7 +15,7 @@ Since 0.1.0, each runtime and its TypeScript compiler run on a dedicated native
 thread. PHP callbacks, objects and closures remain on the PHP thread. With
 Revolt autoloaded, waiting suspends the calling Fiber rather than the PHP thread.
 Synchronous `php.*` callbacks and `Js\Callback` keep their existing API, including
-nested calls. `QuickJS::executionMode()` returns `worker`; there is no inline mode.
+nested calls.
 Call `$js->close()` to interrupt JS, join its worker and release PHP capabilities.
 Close live runtimes before `fork()` and create new runtimes in the child; inherited runtimes reject entries in the child.
 

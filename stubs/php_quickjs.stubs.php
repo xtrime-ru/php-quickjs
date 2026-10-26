@@ -44,9 +44,6 @@ class QuickJS
      */
     public function manifest(): mixed {}
 
-    /** JavaScript execution mode. */
-    public static function executionMode(): string {}
-
     /** Stop this runtime; future entries fail. */
     public function close(): void {}
 

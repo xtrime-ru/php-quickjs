@@ -2,7 +2,7 @@
 
 Since 0.1.0, each `QuickJS` owns a native OS thread. The runtime, contexts,
 JavaScript values, Promise jobs, TypeScript compiler and transpile cache stay on
-that thread. `QuickJS::executionMode()` returns `worker`; there is no inline mode.
+that thread.
 The PHP API remains synchronous in shape: `eval()` and `Js\Callback` await their
 result, including returned Promises and thenables. Detached jobs remain queued
 until `executePendingJobs()` or a returned Promise requires them.

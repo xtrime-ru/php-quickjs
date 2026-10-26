@@ -104,11 +104,6 @@ impl QuickJS {
         self.engine.eval(code, typescript)
     }
 
-    /// JavaScript always executes on a dedicated native thread.
-    pub fn executionMode() -> &'static str {
-        "worker"
-    }
-
     /// Stop this runtime and release its native worker. Further entries fail.
     pub fn close(&self) -> PhpResult<()> {
         self.engine.close()

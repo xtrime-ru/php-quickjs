@@ -3,7 +3,6 @@ require __DIR__ . '/_harness.php';
 require __DIR__ . '/../../vendor/autoload.php';
 use Revolt\EventLoop;
 
-eq('worker', QuickJS::executionMode(), 'worker execution is the only runtime mode');
 throws(fn() => new QuickJS(memoryLimit: 1), Throwable::class, 'failed initialization joins its worker and reports an error');
 $js = new QuickJS(timeoutMs: 2000);
 $ticks = 0;
