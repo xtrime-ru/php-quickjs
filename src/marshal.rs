@@ -160,7 +160,9 @@ impl<'js> JsConversion<'_, 'js> {
         // Uint8Array -> Bytes (checked before the generic object branch).
         if value.is_object() {
             if let Ok(ta) = TypedArray::<u8>::from_value(value.clone()) {
-                if let Some(bytes) = ta.as_bytes() {
+                // SAFETY: copy the bytes before executing any JavaScript; budget accounting
+                // only updates Rust state and throws after the slice is no longer used.
+                if let Some(bytes) = unsafe { ta.as_bytes() } {
                     self.budget
                         .charge(bytes.len())
                         .map_err(|e| rquickjs::Exception::throw_type(ctx, e))?;

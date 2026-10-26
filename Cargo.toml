@@ -2,7 +2,7 @@
 name = "php_quickjs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.96"
+rust-version = "1.97"
 description = "Embed a QuickJS sandbox in PHP with typed, bidirectional communication"
 license = "MIT"
 authors = ["Edd Mann <the@eddmann.com>"]
@@ -17,19 +17,19 @@ name = "php_quickjs"
 crate-type = ["cdylib"]
 
 [dependencies]
-ext-php-rs = { version = "0.15", features = ["closure"] }
-rquickjs = { version = "0.12", default-features = false, features = [
+ext-php-rs = { version = "0.16.3", features = ["closure"] }
+rquickjs = { version = "0.14.0", default-features = false, features = [
     "std",
     "macro",
     "classes",
     "array-buffer",
 ] }
-serde_json = "1"
+serde_json = "1.0.154"
 
 # TypeScript fast path: transpile guest TS -> JS in-process, remap errors.
-oxc = { version = "0.137", features = ["full"] }
-sourcemap = "9"
-lru = "0.12"
+oxc = { version = "0.155.0", features = ["full"] }
+sourcemap = "9.3.2"
+lru = "0.19.0"
 
 [profile.release]
 opt-level = 3

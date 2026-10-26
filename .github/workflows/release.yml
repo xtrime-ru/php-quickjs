@@ -41,7 +41,7 @@ jobs:
           php-version: ${{ matrix.php }}
         env:
           phpts: nts
-      - uses: dtolnay/rust-toolchain@1.96
+      - uses: dtolnay/rust-toolchain@1.99.1
       # ubuntu-22.04 (kept for glibc 2.35 portability) defaults to clang 14,
       # whose emmintrin.h trips a bindgen SSE2 intrinsics bug when parsing the
       # PHP headers on x86_64. clang 15+ fixes it; aarch64 never hits it.
@@ -162,7 +162,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-      - uses: dtolnay/rust-toolchain@1.96
+      - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo build --release
       - name: Stage artifact
         run: |

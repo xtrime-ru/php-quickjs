@@ -93,7 +93,7 @@ pub enum WireError {
 impl WireError {
     pub fn into_php(self) -> PhpException {
         match self {
-            Self::Internal(s) => PhpException::default(s),
+            Self::Internal(s) => PhpException::from_message(s),
             Self::Timeout => {
                 PhpException::from_class::<crate::exceptions::QuickJSTimeoutException>(
                     "JavaScript execution timed out".into(),

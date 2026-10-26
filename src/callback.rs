@@ -26,9 +26,10 @@ impl JsCallback {
         Ok(())
     }
     fn invoke_inner(&self, args: &[&Zval]) -> PhpResult<Zval> {
-        self.check_realm().map_err(PhpException::default)?;
-        let _guard = self.engine.enter().map_err(PhpException::default)?;
-        let args = arguments_to_middle(args, &self.engine.state).map_err(PhpException::default)?;
+        self.check_realm().map_err(PhpException::from_message)?;
+        let _guard = self.engine.enter().map_err(PhpException::from_message)?;
+        let args =
+            arguments_to_middle(args, &self.engine.state).map_err(PhpException::from_message)?;
         self.engine.callback(self.id, args)
     }
 }

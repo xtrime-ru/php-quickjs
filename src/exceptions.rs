@@ -91,7 +91,7 @@ pub fn eval_exception(
     }
     match obj.into_zval(false) {
         Ok(zval) => {
-            let mut ex = PhpException::default(message);
+            let mut ex = PhpException::from_message(message);
             ex.set_object(Some(zval));
             ex
         }

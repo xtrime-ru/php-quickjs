@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-dev
-    image: php-quickjs-dev:php85-rust196
+    image: php-quickjs-dev:php85-rust199
     working_dir: /workspace
     volumes:
       - .:/workspace

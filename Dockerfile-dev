@@ -2,7 +2,7 @@ FROM composer:2 AS composer
 
 FROM php:8.5-cli-bookworm
 
-ARG RUST_VERSION=1.96.1
+ARG RUST_VERSION=1.99.1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

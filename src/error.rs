@@ -8,7 +8,7 @@
 
 use ext_php_rs::error::Error as PhpError;
 use ext_php_rs::exception::PhpException;
-use ext_php_rs::zend::ClassEntry;
+use ext_php_rs::zend::{ClassEntry, ExecutorGlobals};
 use rquickjs::{Ctx, Error as JsError, Exception, Object};
 
 /// A host-side failure carried back to JS: the originating class (a PHP
@@ -32,7 +32,12 @@ impl HostError {
 /// `Display`, which debug-prints the raw object (NUL-laden memory).
 pub fn php_exception_info(err: PhpError) -> HostError {
     match err {
-        PhpError::Exception(obj) => {
+        PhpError::ExceptionPending { class } => {
+            let Some(obj) = ExecutorGlobals::take_exception() else {
+                return HostError::internal(format!(
+                    "PHP exception of class {class} is no longer pending"
+                ));
+            };
             let class = obj
                 .get_class_name()
                 .unwrap_or_else(|_| "Exception".to_owned());

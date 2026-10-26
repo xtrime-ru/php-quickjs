@@ -27,7 +27,7 @@ docker compose run --rm --build dev
 docker compose run --rm --build dev make release
 ```
 
-`Dockerfile-dev` pins PHP 8.5 and Rust 1.96.1. Compose mounts the checkout at
+`Dockerfile-dev` pins PHP 8.5 and Rust 1.99.1. Compose mounts the checkout at
 `/workspace`, writes build artifacts to `target/docker`, and keeps Cargo and
 Composer downloads in `.cache/cargo` and `.cache/composer` (ignored by Git).
 It creates no Docker-managed volumes.
@@ -124,7 +124,7 @@ extension=/var/task/quickjs.so
 
 ## Build from source
 
-Requires Rust 1.96+, clang, and PHP 8.4/8.5 dev headers (`php-config`).
+Requires Rust 1.97+, clang, and PHP 8.4/8.5 dev headers (`php-config`).
 
 ```sh
 git clone https://github.com/eddmann/php-quickjs && cd php-quickjs

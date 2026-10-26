@@ -48,7 +48,7 @@ impl Waiter {
 pub(crate) fn call_php(class: &str, method: &str, args: Vec<&dyn IntoZvalDyn>) -> PhpResult<Zval> {
     PhpFunction::try_from_method(class, method)
         .ok_or_else(|| {
-            PhpException::default(format!(
+            PhpException::from_message(format!(
                 "{class}::{method} unavailable; autoload revolt/event-loop"
             ))
         })?
@@ -57,7 +57,7 @@ pub(crate) fn call_php(class: &str, method: &str, args: Vec<&dyn IntoZvalDyn>) -
 }
 fn function(name: &str, args: Vec<&dyn IntoZvalDyn>) -> PhpResult<Zval> {
     PhpFunction::try_from_function(name)
-        .ok_or_else(|| PhpException::default(format!("PHP function {name} unavailable")))?
+        .ok_or_else(|| PhpException::from_message(format!("PHP function {name} unavailable")))?
         .try_call(args)
         .map_err(Into::into)
 }
@@ -135,7 +135,7 @@ impl Engine {
     }
     pub fn eval(&self, code: String, typescript: bool) -> PhpResult<Zval> {
         if self.is_active() {
-            return Err(PhpException::default(
+            return Err(PhpException::from_message(
                 "Cannot eval while JavaScript is executing; use a JS callback".into(),
             ));
         }
@@ -149,7 +149,7 @@ impl Engine {
     }
     pub fn jobs(&self, max: i64) -> PhpResult<Zval> {
         if self.is_active() {
-            return Err(PhpException::default(
+            return Err(PhpException::from_message(
                 "Cannot run jobs while JavaScript is executing".into(),
             ));
         }
@@ -170,7 +170,7 @@ impl Engine {
     fn request(&self, op: Operation) -> PhpResult<Zval> {
         self.port.check().map_err(WireError::into_php)?;
         if self.waiters.borrow().len() >= 256 {
-            return Err(PhpException::default(
+            return Err(PhpException::from_message(
                 "Too many pending QuickJS operations (256)".into(),
             ));
         }
@@ -218,7 +218,7 @@ impl Engine {
                 let result = self.results.borrow_mut().remove(&id);
                 if let Some(result) = result {
                     let data = result.map_err(WireError::into_php)?;
-                    return middle_to_zval(&data, &self.state).map_err(PhpException::default);
+                    return middle_to_zval(&data, &self.state).map_err(PhpException::from_message);
                 }
                 self.port.check().map_err(WireError::into_php)?;
                 if let Some(w) = &waiter {
@@ -276,7 +276,7 @@ impl Engine {
                     })?;
                 }
             }
-            Event::Stopped(message) => return Err(PhpException::default(message)),
+            Event::Stopped(message) => return Err(PhpException::from_message(message)),
         }
         Ok(())
     }
@@ -288,7 +288,7 @@ impl Engine {
         let filename = format!("php://fd/{}", self.port.wake.as_raw_fd());
         let stream = function("fopen", vec![&filename, &"r"])?;
         if stream.is_false() {
-            return Err(PhpException::default(
+            return Err(PhpException::from_message(
                 "Cannot open QuickJS notification descriptor".into(),
             ));
         }

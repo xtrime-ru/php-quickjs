@@ -94,7 +94,7 @@ the one matching your platform:
 extension=/path/to/php-quickjs-...so
 ```
 
-Or build from source (Rust 1.96+, clang, PHP dev headers — a plain cargo `cdylib`, no
+Or build from source (Rust 1.97+, clang, PHP dev headers — a plain cargo `cdylib`, no
 `phpize`):
 
 ```sh
@@ -102,7 +102,7 @@ git clone https://github.com/eddmann/php-quickjs && cd php-quickjs
 make release
 ```
 
-To build and test with PHP 8.5 + Rust 1.96.1 in Docker:
+To build and test with PHP 8.5 + Rust 1.99.1 in Docker:
 
 ```sh
 docker compose run --rm --build dev

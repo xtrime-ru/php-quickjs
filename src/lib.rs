@@ -54,22 +54,22 @@ impl QuickJS {
         let max_queued_message_bytes = match maxQueuedMessageBytes {
             None => bridge::DEFAULT_MAX_QUEUED_MESSAGE_BYTES,
             Some(limit) if limit > 0 => usize::try_from(limit).map_err(|_| {
-                PhpException::default("maxQueuedMessageBytes is too large".to_owned())
+                PhpException::from_message("maxQueuedMessageBytes is too large".to_owned())
             })?,
             _ => {
-                return Err(PhpException::default(
+                return Err(PhpException::from_message(
                     "maxQueuedMessageBytes must be positive".to_owned(),
                 ))
             }
         };
         let transpile_cache_max_bytes = usize::try_from(transpileCacheMaxBytes).map_err(|_| {
-            PhpException::default(
+            PhpException::from_message(
                 "transpileCacheMaxBytes must be a non-negative integer fitting usize".to_owned(),
             )
         })?;
         let transpile_cache_max_entries =
             usize::try_from(transpileCacheMaxEntries).map_err(|_| {
-                PhpException::default(
+                PhpException::from_message(
                     "transpileCacheMaxEntries must be a non-negative integer fitting usize"
                         .to_owned(),
                 )
@@ -94,7 +94,7 @@ impl QuickJS {
         self.engine
             .state
             .register(name, callable, types)
-            .map_err(PhpException::default)
+            .map_err(PhpException::from_message)
     }
 
     /// Evaluate source and marshal its result back to PHP. TypeScript is
@@ -125,7 +125,7 @@ impl QuickJS {
     pub fn executePendingJobs(&self, maxJobs: i64) -> PhpResult<i64> {
         self.require_shared_jobs()?;
         if maxJobs <= 0 {
-            return Err(PhpException::default(
+            return Err(PhpException::from_message(
                 "maxJobs must be greater than zero".to_owned(),
             ));
         }
@@ -136,7 +136,7 @@ impl QuickJS {
     /// an awaiting driver yields; no JS entry or Promise job is executed.
     pub fn drainMessages(&self) -> PhpResult<Zval> {
         let messages = marshal::MiddleValue::Array(self.engine.drain_messages()?);
-        middle_to_zval(&messages, &self.engine.state).map_err(PhpException::default)
+        middle_to_zval(&messages, &self.engine.state).map_err(PhpException::from_message)
     }
 
     /// Return the registration manifest as an array of `['name'=>..., 'types'=>...]`.
@@ -159,7 +159,7 @@ impl QuickJS {
                 })
                 .collect(),
         );
-        marshal::middle_to_zval(&mv, state).map_err(PhpException::default)
+        marshal::middle_to_zval(&mv, state).map_err(PhpException::from_message)
     }
 
     /// Generate a TypeScript `.d.ts` declaration for the `php` global from the
@@ -184,7 +184,7 @@ impl QuickJS {
             .state
             .handles
             .resolve(handle)
-            .ok_or_else(|| PhpException::default(format!("unknown handle: {handle}")))
+            .ok_or_else(|| PhpException::from_message(format!("unknown handle: {handle}")))
     }
 
     /// Revoke a handle, releasing the host-side reference. Returns whether the
@@ -197,7 +197,7 @@ impl QuickJS {
     /// leg of the marshaling pipeline (PHP -> middle -> JS -> middle -> PHP).
     pub fn roundtrip(&self, value: &Zval) -> PhpResult<Zval> {
         let state = self.engine.state.clone();
-        let middle = zval_to_middle(value, &state).map_err(PhpException::default)?;
+        let middle = zval_to_middle(value, &state).map_err(PhpException::from_message)?;
         self.engine.roundtrip(middle)
     }
 }
@@ -205,7 +205,7 @@ impl QuickJS {
 impl QuickJS {
     fn require_shared_jobs(&self) -> PhpResult<()> {
         if self.engine.isolated() {
-            return Err(PhpException::default(
+            return Err(PhpException::from_message(
                 "Promise jobs require shared mode (isolated: false)".to_owned(),
             ));
         }
