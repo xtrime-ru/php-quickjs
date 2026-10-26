@@ -79,11 +79,7 @@ impl ConversionBudget {
 
 /// Failed conversion never hands the registered functions to PHP. Defer their
 /// deletion just like dropped wrappers, without executing JS during unwinding.
-pub fn js_to_middle<'js>(
-    ctx: &Ctx<'js>,
-    value: Value<'js>,
-    state: &BridgeState,
-) -> rquickjs::Result<MiddleValue> {
+pub fn js_to_middle<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<MiddleValue> {
     let mut conversion = JsConversion {
         ctx,
         budget: ConversionBudget::default(),
@@ -93,7 +89,9 @@ pub fn js_to_middle<'js>(
     let result = conversion.convert(value, 0);
     if result.is_err() {
         for id in conversion.registered {
-            state.queue_fn_deletion(id);
+            if let Ok(del) = ctx.globals().get::<_, Function>("__deleteJsFn") {
+                let _ = del.call::<_, ()>((id as f64,));
+            }
         }
     }
     result

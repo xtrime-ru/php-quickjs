@@ -17,10 +17,10 @@ mod manifest;
 mod marshal;
 mod sandbox;
 mod transpile;
+mod worker;
 
 use engine::Engine;
-use exceptions::{QuickJSMemoryException, QuickJSTimeoutException};
-use marshal::{js_to_middle, middle_to_js, middle_to_zval, zval_to_middle};
+use marshal::{middle_to_zval, zval_to_middle};
 
 /// An embedded QuickJS sandbox with a typed, bidirectional PHP bridge.
 #[php_class]
@@ -67,11 +67,13 @@ impl QuickJS {
                 "transpileCacheMaxBytes must be a non-negative integer fitting usize".to_owned(),
             )
         })?;
-        let transpile_cache_max_entries = usize::try_from(transpileCacheMaxEntries).map_err(|_| {
-            PhpException::default(
-                "transpileCacheMaxEntries must be a non-negative integer fitting usize".to_owned(),
-            )
-        })?;
+        let transpile_cache_max_entries =
+            usize::try_from(transpileCacheMaxEntries).map_err(|_| {
+                PhpException::default(
+                    "transpileCacheMaxEntries must be a non-negative integer fitting usize"
+                        .to_owned(),
+                )
+            })?;
         let engine = Engine::new(
             memoryLimit.unwrap_or(0).max(0) as usize,
             timeoutMs.unwrap_or(0).max(0) as u64,
@@ -80,20 +82,15 @@ impl QuickJS {
             max_queued_message_bytes,
             transpile_cache_max_entries,
             transpile_cache_max_bytes,
-        )
-        .map_err(to_php_err)?;
+        )?;
         Ok(QuickJS { engine })
     }
 
     /// Register a PHP callable under a flat, dotted capability name, optionally
     /// with a TypeScript signature used for `.d.ts` generation. The name
     /// becomes callable from JS as `php.<dotted.name>(...)`.
-    pub fn register(
-        &mut self,
-        name: String,
-        callable: &Zval,
-        types: Option<String>,
-    ) -> PhpResult<()> {
+    pub fn register(&self, name: String, callable: &Zval, types: Option<String>) -> PhpResult<()> {
+        self.engine.ensure_open()?;
         self.engine
             .state
             .register(name, callable, types)
@@ -104,60 +101,23 @@ impl QuickJS {
     /// transpiled by default; false executes JavaScript directly.
     #[php(defaults(typescript = true))]
     pub fn eval(&self, code: String, typescript: bool) -> PhpResult<Zval> {
-        if self.engine.is_active() {
-            return Err(PhpException::default(
-                "Cannot eval while JavaScript is executing; use a JS callback".to_owned(),
-            ));
-        }
-        let module = if typescript {
-            self.engine.transpile.get_or_transpile(&code).map_err(|e| {
-                let stack = if e.line > 0 {
-                    format!("    at guest.ts:{}:{}", e.line, e.col)
-                } else {
-                    String::new()
-                };
-                exceptions::eval_exception(
-                    "SyntaxError".to_owned(),
-                    e.message,
-                    "guest.ts",
-                    e.line,
-                    stack,
-                )
-            })?
-        } else {
-            transpile::Transpiled {
-                module_id: "guest.js".to_owned(),
-                js: Rc::from(code),
-                map_json: None,
-            }
-        };
+        self.engine.eval(code, typescript)
+    }
 
-        let state = self.engine.state.clone();
-        self.engine.eval_in(|ctx| {
-            let map = module.map_json.clone();
-            let eval_err = |e| self.classify_js_error(ctx, e, map.as_deref(), &module.module_id);
-            bridge::install(ctx, state.clone()).map_err(&eval_err)?;
-            // Name the module so stack frames are attributable and remappable.
-            let mut opts = rquickjs::context::EvalOptions::default();
-            opts.filename = Some(module.module_id.clone());
-            let value: rquickjs::Value = ctx
-                .eval_with_options(module.js.as_bytes(), opts)
-                .map_err(&eval_err)?;
-            let value = self.engine.await_value(ctx, value, eval_err)?;
-            let middle = js_to_middle(ctx, value, &state).map_err(&eval_err)?;
-            middle_to_zval(&middle, &state).map_err(PhpException::default)
-        })
+    /// JavaScript always executes on a dedicated native thread.
+    pub fn executionMode() -> &'static str {
+        "worker"
+    }
+
+    /// Stop this runtime and release its native worker. Further entries fail.
+    pub fn close(&self) -> PhpResult<()> {
+        self.engine.close()
     }
 
     /// Whether Promise jobs are ready. This does not include pending host I/O.
     pub fn hasPendingJobs(&self) -> PhpResult<bool> {
         self.require_shared_jobs()?;
-        self.engine.eval_in(|ctx| {
-            // SAFETY: the context and its runtime are locked by eval_in.
-            Ok(unsafe {
-                rquickjs::qjs::JS_IsJobPending(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()))
-            })
-        })
+        Ok(self.engine.has_jobs()?.bool().unwrap_or(false))
     }
 
     /// Execute at most maxJobs ready jobs without waiting for host I/O.
@@ -169,19 +129,13 @@ impl QuickJS {
                 "maxJobs must be greater than zero".to_owned(),
             ));
         }
-        if self.engine.is_active() {
-            return Err(PhpException::default(
-                "Cannot run jobs while JavaScript is executing".to_owned(),
-            ));
-        }
-        self.engine
-            .eval_in(|ctx| self.engine.run_jobs(ctx, maxJobs))
+        Ok(self.engine.jobs(maxJobs)?.long().unwrap_or(0))
     }
 
     /// Drain messages emitted with `quickjs.postMessage`. Safe to call after
     /// an awaiting driver yields; no JS entry or Promise job is executed.
     pub fn drainMessages(&self) -> PhpResult<Zval> {
-        let messages = marshal::MiddleValue::Array(self.engine.state.drain_messages());
+        let messages = marshal::MiddleValue::Array(self.engine.drain_messages()?);
         middle_to_zval(&messages, &self.engine.state).map_err(PhpException::default)
     }
 
@@ -218,8 +172,9 @@ impl QuickJS {
     /// Grant JS access to a live PHP value (e.g. a database connection) as an
     /// opaque integer handle. The value is kept host-side; JS only ever sees
     /// the id and must pass it back to a capability to use it.
-    pub fn grant(&self, resource: &Zval) -> i64 {
-        self.engine.state.handles.grant(resource)
+    pub fn grant(&self, resource: &Zval) -> PhpResult<i64> {
+        self.engine.ensure_open()?;
+        Ok(self.engine.state.handles.grant(resource))
     }
 
     /// Resolve a handle previously returned by `grant()` back to its live PHP
@@ -243,72 +198,19 @@ impl QuickJS {
     pub fn roundtrip(&self, value: &Zval) -> PhpResult<Zval> {
         let state = self.engine.state.clone();
         let middle = zval_to_middle(value, &state).map_err(PhpException::default)?;
-        self.engine.eval_in(|ctx| {
-            // Runtime support must exist for any function reconstruction.
-            bridge::install(ctx, state.clone())
-                .map_err(|e| PhpException::default(error::js_error_message(ctx, e)))?;
-            let js = middle_to_js(ctx, &middle).map_err(to_php_err)?;
-            let back = js_to_middle(ctx, js, &state).map_err(to_php_err)?;
-            middle_to_zval(&back, &state).map_err(PhpException::default)
-        })
+        self.engine.roundtrip(middle)
     }
 }
 
 impl QuickJS {
     fn require_shared_jobs(&self) -> PhpResult<()> {
-        if self.engine.shared_ctx().is_none() {
+        if self.engine.isolated() {
             return Err(PhpException::default(
                 "Promise jobs require shared mode (isolated: false)".to_owned(),
             ));
         }
         Ok(())
     }
-
-    /// Map a JS-side failure to the most specific PHP exception class: timeout
-    /// (deadline tripped), memory (heap limit), else a generic eval error. For
-    /// the eval case the JS stack is remapped to TypeScript coordinates via the
-    /// module's source map and surfaced in the message.
-    fn classify_js_error(
-        &self,
-        ctx: &rquickjs::Ctx<'_>,
-        err: rquickjs::Error,
-        map_json: Option<&str>,
-        module_id: &str,
-    ) -> PhpException {
-        let parts = error::js_error_parts(ctx, err);
-        let message = parts.display_message();
-        match error::resource_error(&parts, self.engine.timed_out()) {
-            Some(error::ResourceError::Timeout) => {
-                return PhpException::from_class::<QuickJSTimeoutException>(message);
-            }
-            Some(error::ResourceError::Memory) => {
-                return PhpException::from_class::<QuickJSMemoryException>(message);
-            }
-            None => {}
-        }
-        // Remap the guest stack to TypeScript coordinates (guest frames only),
-        // and surface it as a structured, JS-error-like exception.
-        let remapped = match (parts.stack.as_deref(), map_json) {
-            (Some(stack), Some(map)) => error::remap_stack(stack, map, module_id),
-            (Some(stack), None) => Some(stack.to_owned()),
-            (None, _) => None,
-        };
-        let (line, _) = remapped
-            .as_deref()
-            .and_then(|s| error::top_frame_location(s, module_id))
-            .unwrap_or((0, 0));
-        exceptions::eval_exception(
-            parts.name,
-            message,
-            module_id,
-            line,
-            remapped.unwrap_or_default(),
-        )
-    }
-}
-
-fn to_php_err<E: std::fmt::Display>(e: E) -> PhpException {
-    PhpException::default(e.to_string())
 }
 
 #[php_module]

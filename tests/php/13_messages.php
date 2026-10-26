@@ -2,7 +2,8 @@
 require __DIR__ . '/_harness.php';
 
 $js = new QuickJS(maxQueuedMessageBytes: 1024);
-eq('0.0.3', phpversion('php_quickjs'), 'extension reports its build version');
+preg_match('/^version = \"([^\"]+)\"/m', file_get_contents(__DIR__ . '/../../Cargo.toml'), $package);
+eq($package[1], phpversion('php_quickjs'), 'extension reports its build version');
 $send = $js->eval('(value) => quickjs.postMessage(value)');
 foreach (['', "nul\0tail", 'Привет 🌍', "\xff\xfe"] as $value) {
     $send($value);

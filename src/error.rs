@@ -98,7 +98,11 @@ pub enum ResourceError {
 pub fn resource_error(parts: &JsErrorParts, timed_out: bool) -> Option<ResourceError> {
     if timed_out {
         Some(ResourceError::Timeout)
-    } else if parts.display_message().to_lowercase().contains("out of memory") {
+    } else if parts
+        .display_message()
+        .to_lowercase()
+        .contains("out of memory")
+    {
         Some(ResourceError::Memory)
     } else {
         None

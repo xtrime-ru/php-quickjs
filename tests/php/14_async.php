@@ -86,14 +86,16 @@ eq([], Revolt\EventLoop::getIdentifiers(), 'timeout leaves no timer behind');
 throws(fn() => Amp\async(fn() => $limited->eval('new Promise(() => {})'))->await(), QuickJSTimeoutException::class, 'deadline wakes an Amp Fiber too');
 eq(3, $limited->eval('1 + 2'), 'engine recovers after an Amp Fiber timeout');
 
-// Delay the owner after a foreign callback is queued, letting its deadline expire.
-$limited->register('cancel', static function ($callback) use (&$future): void {
+// The worker may finish a JS callback while the PHP event loop is blocked.
+// Its execution is no longer delayed until PHP returns from usleep().
+$blocked = new QuickJS(timeoutMs: 100);
+$blocked->register('start', static function ($callback) use (&$future): void {
     $future = Amp\async(static fn() => $callback());
-    Revolt\EventLoop::queue(static fn() => usleep(40000));
+    Revolt\EventLoop::queue(static fn() => usleep(200000));
 });
-throws(fn() => Amp\async(fn() => $limited->eval('new Promise(() => php.cancel(() => { globalThis.late = true; return 42; }))'))->await(), QuickJSTimeoutException::class, 'expired owner does not execute queued callbacks');
-throws(fn() => $future->await(), Exception::class, 'canceled callback wakes its caller with an exception');
-eq('undefined', $limited->eval('typeof late'), 'canceled callback has no side effects');
+throws(fn() => Amp\async(fn() => $blocked->eval('new Promise(() => php.start(() => { globalThis.completed = true; return 42; }))'))->await(), QuickJSTimeoutException::class, 'unresolved owner still times out while PHP is blocked');
+eq(42, $future->await(), 'worker callback completes independently of blocked PHP');
+eq(true, $blocked->eval('completed'), 'completed callback side effects are preserved');
 // Isolated entries still receive external callbacks, but pending callback
 // Promises must release their Persistent handles before their runtime is freed.
 $isolated = new QuickJS(isolated: true, timeoutMs: 1000);

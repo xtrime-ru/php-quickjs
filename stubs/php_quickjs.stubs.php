@@ -44,6 +44,12 @@ class QuickJS
      */
     public function manifest(): mixed {}
 
+    /** JavaScript execution mode. */
+    public static function executionMode(): string {}
+
+    /** Stop this runtime; future entries fail. */
+    public function close(): void {}
+
     /** Whether Promise jobs are ready (shared mode only). Does not include host I/O. */
     public function hasPendingJobs(): bool {}
 

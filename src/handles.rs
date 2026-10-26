@@ -34,9 +34,14 @@ impl HandleTable {
     /// Drop a handle, releasing the host-side reference. Returns whether it
     /// existed.
     pub fn revoke(&self, id: i64) -> bool {
-        self.map.borrow_mut().remove(&id).is_some()
+        let value = self.map.borrow_mut().remove(&id);
+        value.is_some()
     }
 
+    pub fn clear(&self) {
+        let values = std::mem::take(&mut *self.map.borrow_mut());
+        drop(values);
+    }
     pub fn len(&self) -> usize {
         self.map.borrow().len()
     }

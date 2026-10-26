@@ -1,19 +1,7 @@
-//! `Js\Callback`: a PHP-facing wrapper around a JS function handed to PHP.
-//!
-//! The JS function itself never leaves the engine; the callback holds only an
-//! integer id into the JS-side registry plus a handle back to the engine. When
-//! invoked from PHP it re-enters JS — reusing the live context if a host call
-//! is already in flight, else acquiring the runtime lock afresh.
-
-use crate::engine::Engine;
-use crate::marshal::{
-    arguments_to_middle, js_to_middle, middle_to_js, middle_to_zval, MiddleValue,
-};
-use ext_php_rs::prelude::*;
-use ext_php_rs::types::Zval;
-use rquickjs::{Ctx, Function, Value};
+//! PHP proxy for a function which remains owned by the JavaScript worker.
+use crate::{engine::Engine, marshal::arguments_to_middle};
+use ext_php_rs::{prelude::*, types::Zval};
 use std::rc::Rc;
-
 #[php_class]
 #[php(name = "Js\\Callback")]
 pub struct JsCallback {
@@ -21,115 +9,41 @@ pub struct JsCallback {
     realm_id: u64,
     pub engine: Rc<Engine>,
 }
-
 impl JsCallback {
     pub fn new(id: u64, engine: Rc<Engine>) -> Self {
-        JsCallback {
+        Self {
             id,
             realm_id: engine.realm_id(),
             engine,
         }
     }
-
     pub fn check_realm(&self) -> Result<(), String> {
         if self.realm_id != self.engine.realm_id()
-            || (self.engine.shared_ctx().is_none() && !self.engine.is_active())
+            || (self.engine.isolated() && !self.engine.is_active())
         {
-            return Err("JS callback belongs to an ended isolated eval".to_owned());
+            return Err("JS callback belongs to an ended isolated eval".into());
         }
         Ok(())
     }
-}
-
-impl Drop for JsCallback {
-    /// Queue this callback's registry entry for release. Deletion is deferred
-    /// (not done here) and flushed at the next eval boundary: a JS function can
-    /// be round-tripped PHP->JS within a single host call, dropping a transient
-    /// wrapper while JS still needs the entry, so deleting eagerly would race.
-    /// Queuing touches no JS and cannot re-enter the engine.
-    fn drop(&mut self) {
-        if self.check_realm().is_ok() {
-            self.engine.state.queue_fn_deletion(self.id);
-        }
-    }
-}
-
-impl JsCallback {
-    /// Invoke the underlying JS function with the given (already PHP-side) args.
     fn invoke_inner(&self, args: &[&Zval]) -> PhpResult<Zval> {
         self.check_realm().map_err(PhpException::default)?;
         let _guard = self.engine.enter().map_err(PhpException::default)?;
-
-        let middle_args =
-            arguments_to_middle(args, &self.engine.state).map_err(PhpException::default)?;
-        let id = self.id;
-        let engine = self.engine.clone();
-
-        if self.engine.active_on_other_fiber()? {
-            return self.engine.queue_callback(id, middle_args);
-        }
-
-        let run = move |ctx: &Ctx<'_>| -> PhpResult<Zval> {
-            invoke_callback(ctx, &engine, id, &middle_args)
-        };
-
-        if !self.engine.is_active() && self.engine.shared_ctx().is_none() {
-            return Err(PhpException::default(
-                "JS callback invoked outside its eval (isolated QuickJS instance)".to_owned(),
-            ));
-        }
-        self.engine.eval_in(run)
+        let args = arguments_to_middle(args, &self.engine.state).map_err(PhpException::default)?;
+        self.engine.callback(self.id, args)
     }
 }
-
-pub(crate) fn invoke_callback(
-    ctx: &Ctx<'_>,
-    engine: &Engine,
-    id: u64,
-    args: &[MiddleValue],
-) -> PhpResult<Zval> {
-    let map_error = |e| engine.callback_error(ctx, e);
-    let value = call_js(ctx, engine, id, args)?;
-    let value = engine.await_value(ctx, value, map_error)?;
-    finish_callback(ctx, engine, value)
-}
-
-pub(crate) fn finish_callback<'js>(
-    ctx: &Ctx<'js>,
-    engine: &Engine,
-    value: Value<'js>,
-) -> PhpResult<Zval> {
-    let map_error = |e| engine.callback_error(ctx, e);
-    let middle = js_to_middle(ctx, value, &engine.state).map_err(map_error)?;
-    middle_to_zval(&middle, &engine.state).map_err(PhpException::default)
-}
-
-pub(crate) fn call_js<'js>(
-    ctx: &Ctx<'js>,
-    engine: &Engine,
-    id: u64,
-    args: &[MiddleValue],
-) -> PhpResult<Value<'js>> {
-    let map_error = |e| engine.callback_error(ctx, e);
-    let get: Function = ctx.globals().get("__getJsFn").map_err(&map_error)?;
-    let function: Function = get.call((id as f64,)).map_err(&map_error)?;
-    let mut call_args = rquickjs::function::Args::new(ctx.clone(), args.len());
-    for arg in args {
-        call_args
-            .push_arg(middle_to_js(ctx, arg).map_err(&map_error)?)
-            .map_err(&map_error)?;
+impl Drop for JsCallback {
+    fn drop(&mut self) {
+        if self.check_realm().is_ok() {
+            self.engine.state.queue_fn_deletion(self.id)
+        }
     }
-    function.call_arg(call_args).map_err(map_error)
 }
-
 #[php_impl]
 impl JsCallback {
-    /// Invoke the JS callback: `$cb(...$args)`.
     pub fn __invoke(&self, args: &[&Zval]) -> PhpResult<Zval> {
         self.invoke_inner(args)
     }
-
-    /// Explicit form: `$cb->call([...$args])`.
     pub fn call(&self, args: &[&Zval]) -> PhpResult<Zval> {
         self.invoke_inner(args)
     }

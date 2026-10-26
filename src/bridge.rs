@@ -2,21 +2,18 @@
 //! through a flat allowlist and the frozen `php.*` facade.
 
 use crate::engine::Engine;
-use crate::error::{throw_host_error, HostError};
+use crate::error::HostError;
 use crate::handles::HandleTable;
 use crate::manifest::ManifestEntry;
-use crate::marshal::{
-    js_to_data, js_to_middle, middle_to_js, middle_to_zval, zval_to_middle, MiddleValue,
-};
+use crate::marshal::{middle_to_zval, zval_to_middle, MiddleValue};
 use ext_php_rs::convert::IntoZvalDyn;
 use ext_php_rs::types::{ZendCallable, Zval};
-use rquickjs::{Ctx, Exception, Function, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 /// Runtime support injected into each context.
-const RUNTIME_JS: &str = include_str!("js/runtime.js");
+pub(crate) const RUNTIME_JS: &str = include_str!("js/runtime.js");
 
 /// Shared host-side state behind the bridge. Single-threaded (PHP NTS), so
 /// `Rc`/`RefCell` interior mutability is sufficient and correct.
@@ -36,15 +33,11 @@ pub struct BridgeState {
     /// JS-callback ids whose PHP wrapper was dropped, awaiting release from the
     /// JS registry (deferred to the next eval boundary; see `JsCallback::drop`).
     pending_fn_deletions: RefCell<Vec<u64>>,
-    messages: RefCell<MessageQueue>,
 }
 
 impl BridgeState {
-    pub fn new(max_queued_message_bytes: usize) -> Rc<Self> {
-        Rc::new(Self {
-            messages: RefCell::new(MessageQueue::new(max_queued_message_bytes)),
-            ..Self::default()
-        })
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self { ..Self::default() })
     }
 
     /// Queue a JS-callback id for release at the next eval boundary.
@@ -52,7 +45,7 @@ impl BridgeState {
         self.pending_fn_deletions.borrow_mut().push(id);
     }
 
-    fn take_pending_deletions(&self) -> Vec<u64> {
+    pub(crate) fn take_pending_deletions(&self) -> Vec<u64> {
         std::mem::take(&mut self.pending_fn_deletions.borrow_mut())
     }
 
@@ -74,7 +67,8 @@ impl BridgeState {
         if !callable.is_callable() {
             return Err(format!("value registered as '{name}' is not callable"));
         }
-        self.dispatch
+        let previous = self
+            .dispatch
             .borrow_mut()
             .insert(name.clone(), callable.shallow_clone());
         let mut manifest = self.manifest.borrow_mut();
@@ -83,6 +77,8 @@ impl BridgeState {
         } else {
             manifest.push(ManifestEntry { name, types });
         }
+        drop(manifest);
+        drop(previous);
         Ok(())
     }
 
@@ -106,18 +102,6 @@ impl BridgeState {
         drop(removed);
     }
 
-    fn push_message(&self, value: MiddleValue, bytes: usize) -> Result<(), &'static str> {
-        self.messages.borrow_mut().push(value, bytes)
-    }
-
-    fn message_capacity(&self) -> usize {
-        self.messages.borrow().remaining()
-    }
-
-    pub(crate) fn drain_messages(&self) -> Vec<MiddleValue> {
-        self.messages.borrow_mut().drain()
-    }
-
     pub fn get_php_fn(&self, id: u64) -> Option<Zval> {
         self.php_funcs.borrow().get(&id).map(Zval::shallow_clone)
     }
@@ -126,17 +110,19 @@ impl BridgeState {
         self.manifest.borrow().clone()
     }
 
-    fn names(&self) -> Vec<String> {
-        self.manifest
-            .borrow()
-            .iter()
-            .map(|e| e.name.clone())
-            .collect()
+    pub fn clear(&self) {
+        let dispatch = std::mem::take(&mut *self.dispatch.borrow_mut());
+        let functions = std::mem::take(&mut *self.php_funcs.borrow_mut());
+        self.manifest.borrow_mut().clear();
+        self.pending_fn_deletions.borrow_mut().clear();
+        self.handles.clear();
+        drop(dispatch);
+        drop(functions);
     }
 }
 
 /// Invoke a PHP callable with already-marshaled args, returning its result.
-fn call_php(
+pub(crate) fn call_php(
     callable_zv: &Zval,
     args: &[MiddleValue],
     state: &BridgeState,
@@ -158,7 +144,7 @@ fn call_php(
 
 /// Dispatch a named host call. Returns `Err` for an unknown capability (the
 /// trust-boundary rejection) or a failed call.
-fn host_call(
+pub(crate) fn host_call(
     state: &BridgeState,
     name: &str,
     args: Vec<MiddleValue>,
@@ -173,7 +159,7 @@ fn host_call(
 }
 
 /// Invoke an anonymous PHP callable (one previously handed to JS) by id.
-fn php_fn_call(
+pub(crate) fn php_fn_call(
     state: &BridgeState,
     id: u64,
     args: Vec<MiddleValue>,
@@ -184,97 +170,8 @@ fn php_fn_call(
     call_php(&callable_zv, &args, state)
 }
 
-fn invoke_host<'js>(
-    ctx: &Ctx<'js>,
-    state: &BridgeState,
-    payload: Value<'js>,
-    call: impl FnOnce(Vec<MiddleValue>) -> Result<MiddleValue, HostError>,
-) -> rquickjs::Result<Value<'js>> {
-    if !payload.is_array() {
-        return Err(Exception::throw_type(
-            ctx,
-            "host arguments must be an array",
-        ));
-    }
-    let MiddleValue::Array(args) = js_to_middle(ctx, payload, state)? else {
-        unreachable!("a JS array converts to MiddleValue::Array")
-    };
-    let result = call(args).map_err(|error| throw_host_error(ctx, &error))?;
-    middle_to_js(ctx, &result)
-}
-
-/// Install native imports, runtime support, and frozen
-/// `php.*` facade. Call once per `eval`, before guest code runs.
-pub fn install<'js>(ctx: &Ctx<'js>, state: Rc<BridgeState>) -> rquickjs::Result<()> {
-    let globals = ctx.globals();
-
-    // Snapshot before borrowing the queue: getters can execute arbitrary JS.
-    if globals
-        .get::<_, Option<rquickjs::Object>>("quickjs")?
-        .is_none()
-    {
-        let message_state = state.clone();
-        let post_message = Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, payload: Value<'js>| -> rquickjs::Result<()> {
-                let (value, bytes) = js_to_data(&ctx, payload, message_state.message_capacity())?;
-                message_state
-                    .push_message(value, bytes)
-                    .map_err(|e| Exception::throw_type(&ctx, e))
-            },
-        )?;
-        let quickjs = rquickjs::Object::new(ctx.clone())?;
-        quickjs.set("postMessage", post_message)?;
-        globals.set("quickjs", quickjs)?;
-        ctx.eval::<(), _>("Object.freeze(globalThis.quickjs); Object.defineProperty(globalThis, 'quickjs', {value: globalThis.quickjs, writable: false, configurable: false})")?;
-    }
-    // JS -> PHP capability calls use the same native conversion as eval.
-    let host_state = state.clone();
-    let host = Function::new(
-        ctx.clone(),
-        move |ctx: Ctx<'js>, name: String, payload: Value<'js>| -> rquickjs::Result<Value<'js>> {
-            invoke_host(&ctx, &host_state, payload, |args| {
-                host_call(&host_state, &name, args)
-            })
-        },
-    )?;
-    globals.set("__host", host)?;
-
-    // JS -> host: invoke an anonymous PHP callable handed to JS earlier.
-    let php_state = state.clone();
-    let php_invoke = Function::new(
-        ctx.clone(),
-        move |ctx: Ctx<'js>, id: f64, payload: Value<'js>| -> rquickjs::Result<Value<'js>> {
-            invoke_host(&ctx, &php_state, payload, |args| {
-                php_fn_call(&php_state, id as u64, args)
-            })
-        },
-    )?;
-    globals.set("__php_invoke", php_invoke)?;
-
-    // Runtime support must precede the frozen facade.
-    ctx.eval::<(), _>(RUNTIME_JS)?;
-    ctx.eval::<(), _>(build_facade(&state.names()))?;
-
-    flush_pending_deletions(ctx, &state)
-}
-
-pub(crate) fn flush_pending_deletions(ctx: &Ctx<'_>, state: &BridgeState) -> rquickjs::Result<()> {
-    let stale = state.take_pending_deletions();
-    if !stale.is_empty() {
-        // A fresh isolated realm has no registry; its preceding realm is gone.
-        let Ok(del) = ctx.globals().get::<_, Function>("__deleteJsFn") else {
-            return Ok(());
-        };
-        for id in stale {
-            del.call::<_, ()>((id as f64,))?;
-        }
-    }
-    Ok(())
-}
-
 /// Generate the JS that builds the frozen `php.*` tree from the dotted names.
-fn build_facade(names: &[String]) -> String {
+pub(crate) fn build_facade(names: &[String]) -> String {
     let mut src = String::from(
         "(function(){\n\
          var php = {};\n",
@@ -327,13 +224,13 @@ const MESSAGE_OVERHEAD: usize = 128;
 
 /// Detached data snapshots waiting for a PHP drain.
 #[derive(Default)]
-struct MessageQueue {
+pub(crate) struct MessageQueue {
     messages: Vec<MiddleValue>,
     bytes: usize,
     limit: usize,
 }
 impl MessageQueue {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             messages: Vec::new(),
             bytes: 0,
@@ -341,7 +238,7 @@ impl MessageQueue {
         }
     }
 
-    fn push(&mut self, value: MiddleValue, bytes: usize) -> Result<(), &'static str> {
+    pub(crate) fn push(&mut self, value: MiddleValue, bytes: usize) -> Result<(), &'static str> {
         let total = self
             .bytes
             .saturating_add(bytes)
@@ -354,12 +251,12 @@ impl MessageQueue {
         Ok(())
     }
 
-    fn drain(&mut self) -> Vec<MiddleValue> {
+    pub(crate) fn drain(&mut self) -> Vec<MiddleValue> {
         self.bytes = 0;
         std::mem::take(&mut self.messages)
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.limit
             .saturating_sub(self.bytes)
             .saturating_sub(MESSAGE_OVERHEAD)

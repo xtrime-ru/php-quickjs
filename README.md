@@ -11,6 +11,14 @@ TypeScript — it's transpiled in-process and runtime errors map back to the ori
 TS source. Pass `typescript: false` to `eval()` for JavaScript that should run
 directly without transpilation.
 
+Since 0.1.0, each runtime and its TypeScript compiler run on a dedicated native
+thread. PHP callbacks, objects and closures remain on the PHP thread. With
+Revolt autoloaded, waiting suspends the calling Fiber rather than the PHP thread.
+Synchronous `php.*` callbacks and `Js\Callback` keep their existing API, including
+nested calls. `QuickJS::executionMode()` returns `worker`; there is no inline mode.
+Call `$js->close()` to interrupt JS, join its worker and release PHP capabilities.
+Close live runtimes before `fork()` and create new runtimes in the child; inherited runtimes reject entries in the child.
+
 Built in Rust with [`ext-php-rs`](https://github.com/davidcole1340/ext-php-rs) and
 [`rquickjs`](https://github.com/DelSkayn/rquickjs). QuickJS-NG is bundled — no system
 library required.

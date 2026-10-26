@@ -11,7 +11,7 @@
         ext-php-rs (zval ↔ Rust)        rquickjs (Rust ↔ JSValue)
 ```
 
-It is **one process, one thread**. The Rust extension is a `cdylib` that PHP
+It is **one process with a dedicated native thread per QuickJS instance**. The Rust extension is a `cdylib` that PHP
 loads natively; `QuickJS`, `Js\Callback`, and the `QuickJS*Exception` classes are
 real PHP classes implemented in Rust.
 
@@ -23,7 +23,7 @@ bounded native queue.
 
 Take `php.math.add(2, 3)` from a guest script.
 
-1. **`eval(tsCode)`** (`lib.rs` → `transpile.rs`) runs oxc: types are stripped,
+1. **`eval(tsCode)`** (`lib.rs` → `engine.rs` → worker RPC → `transpile.rs`) runs oxc on the worker: types are stripped,
    the target is esnext (a near-identity transform), and the output is JS plus a
    source map. The map is cached **host-side**, keyed by a content hash; it never
    enters the sandbox. QuickJS only ever sees JavaScript.
@@ -38,16 +38,14 @@ Take `php.math.add(2, 3)` from a guest script.
    };
    ```
 
-3. `__host` is the native entry point for registered PHP capabilities. In
-   `bridge.rs` it:
-   - converts JS values to a `MiddleValue` list,
-   - looks `"math.add"` up in the **dispatch table** (rejects if not registered —
-     this is the trust boundary),
-   - converts each arg `MiddleValue → zval`,
-   - calls the PHP callable via `ZendCallable::try_call`.
+3. `__host` in `worker.rs` converts JS arguments to owned `MiddleValue`
+   data and sends a host-call request. `engine.rs` receives it on the PHP thread.
+   `bridge.rs` looks the name up in the allowlist, converts arguments to Zend
+   values and invokes the PHP callable. Only this PHP thread touches Zend.
 
-4. The result travels back `zval → MiddleValue → JS value`. `5` lands in the
-   guest without a byte serialization round-trip.
+4. The reply travels back through the command channel as owned Rust data. The
+   worker reconstructs its JS result. No JSON encoding is involved. While waiting
+   for this reply it can service nested JS function requests from PHP.
 
 Adding a capability never changes the dispatch mechanism: all capabilities use
 one dispatch table. The flat, dotted-name list (`manifest()`) is the complete
@@ -59,8 +57,8 @@ audit surface for PHP callables.
 tree, makes each leaf a function calling `__host("dotted.name", args)`, then
 **deep-freezes** the whole tree. Freezing is a security requirement, not a
 nicety: a guest must not be able to reassign `php.http.get` to fool other code.
-The facade is (re)built at the start of every `eval` so newly registered
-capabilities appear.
+The facade is rebuilt when the registration manifest changes. Its frozen object
+is reused and rebound at entry otherwise, avoiding repeated compilation.
 
 ## Value marshaling
 
@@ -108,19 +106,26 @@ Rust converts these references without JS-side wrapping or decoding.
 `Js\Callback::__invoke` (`callback.rs`) looks up the function with `__getJsFn`,
 converts its arguments, invokes it, and awaits any returned Promise.
 
-The subtlety is **re-entrancy**. Each engine records its own active context
-while inside `Context::with`. A nested callback reuses that context instead of
-acquiring the runtime lock again. A callback owned by another engine enters its
-own context. The active pointer is cleared by a scope guard on return, including
-errors. A re-entrancy depth cap (200) bounds recursive bridge calls.
+The PHP wrapper holds an integer function ID and an owning engine reference;
+actual JS objects never cross threads. PHP callable and resource handles likewise
+stay on the PHP side. Owned `MiddleValue` data is `Send`; no unsafe `Send` shim is
+used to move a runtime, Zend value, context or function between threads.
 
-At an outer entry, QuickJS's stack limit is refreshed for the current PHP Fiber.
-The engine records that Fiber as its owner. Like php-tokio, a host callback may
-suspend while its native Rust/QuickJS stack remains alive, but another Fiber may
-not enter the same engine. External Promise callbacks are queued by Revolt and
-executed after the owner resumes. The same entry guard arms and clears the
-execution deadline for evals, callbacks, and job batches. See
-[asynchronous execution](async.md).
+`worker.rs` owns the runtime and processes requests, host replies and ready jobs.
+Returned Promises are tracked independently. A synchronous host wait can process
+nested function requests, preventing PHP -> JS -> PHP deadlocks. A depth cap of
+200 and inherited deadlines bound recursion. Isolated runtimes cancel remaining
+callback requests before releasing their context.
+
+`engine.rs` owns PHP dispatch and Revolt suspensions. A notification socket wakes
+waiting Fibers; host callbacks run on the calling PHP thread and may suspend.
+Without an autoloaded Revolt driver, synchronous requests use a blocking receive
+loop and unresolved external waits fail clearly. See [asynchronous execution](async.md).
+
+The cached facade and pending Promise roots are explicitly released before
+context teardown, including panic unwinding, so native closure cycles cannot
+retain a dead runtime. `close()` interrupts and joins the worker, then releases
+PHP capabilities and handles. The engine validates its creator PID on entry.
 
 ## Capability handles
 
