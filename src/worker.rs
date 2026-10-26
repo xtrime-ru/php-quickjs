@@ -279,6 +279,7 @@ impl Port {
                     config,
                     token: Cell::new(0),
                     notification_pending: Cell::new(false),
+                    thread: thread::current(),
                 });
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run(ready_tx)));
@@ -415,6 +416,7 @@ struct Driver {
     config: Config,
     token: Cell<u64>,
     notification_pending: Cell<bool>,
+    thread: thread::Thread,
 }
 impl Driver {
     fn notify(&self) {
@@ -1069,15 +1071,23 @@ impl<'js> Session<'js> {
         }
         let had_pending = !self.pending.borrow().is_empty();
         self.settle(ctx);
+        if self.root_finished.get() {
+            return false;
+        }
         if self.timed_out.replace(false) && !had_pending {
             self.driver.signals.pump.store(false, Ordering::SeqCst);
             self.driver.emit(Event::AsyncError(WireError::Timeout));
         }
-        for _ in 0..64 {
+        for index in 0..64 {
             let command = self.driver.commands.try_recv().ok();
             let Some(command) = command else { break };
-            if !self.command(ctx, command) {
+            if !self.command(ctx, command) || self.root_finished.get() {
                 return false;
+            }
+            if index == 63 {
+                // Notifications coalesce. A full quantum may leave commands
+                // queued even when no JS jobs can wake the executor again.
+                self.driver.thread.unpark();
             }
         }
         self.driver.flush_notifications();
