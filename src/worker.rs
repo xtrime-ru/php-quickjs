@@ -151,6 +151,7 @@ pub enum Event {
         result: Result<Data, WireError>,
     },
     Host {
+        owner: Option<u64>,
         token: u64,
         target: HostTarget,
         args: Vec<Data>,
@@ -529,6 +530,7 @@ impl Driver {
                         facade: RefCell::new(None),
                         js_depth: Cell::new(0),
                         reported_failure: Cell::new(false),
+                        active_request: Cell::new(None),
                     });
                     let _cleanup = SessionCleanup(session.clone());
                     install(&ctx, session.clone()).map_err(|e| error::js_error_message(&ctx, e))?;
@@ -631,6 +633,13 @@ struct Session<'js> {
     facade: RefCell<Option<rquickjs::Object<'js>>>,
     js_depth: Cell<usize>,
     reported_failure: Cell<bool>,
+    active_request: Cell<Option<u64>>,
+}
+struct RequestScope<'a>(&'a Cell<Option<u64>>, Option<u64>);
+impl Drop for RequestScope<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.1);
+    }
 }
 // Native closures retain Session. Break its JS roots before the context is freed,
 // including panic unwinding; otherwise a cached facade could retain the runtime.
@@ -817,6 +826,10 @@ impl<'js> Session<'js> {
         Ok(command.is_none_or(|command| self.command(ctx, command)))
     }
     fn request(&self, ctx: &Ctx<'js>, request: Request) {
+        let _owner = RequestScope(
+            &self.active_request,
+            self.active_request.replace(Some(request.id)),
+        );
         let Request {
             id,
             op,
@@ -1177,6 +1190,7 @@ impl<'js> Session<'js> {
         self.driver.token.set(token);
         self.replies.borrow_mut().insert(token, None);
         self.driver.emit(Event::Host {
+            owner: self.active_request.get(),
             token,
             target,
             args,

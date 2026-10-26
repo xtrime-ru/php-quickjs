@@ -302,11 +302,7 @@ impl Engine {
             start()?;
             loop {
                 loop {
-                    let event = self
-                        .events
-                        .borrow_mut()
-                        .pop_front()
-                        .or_else(|| self.port.receive().ok());
+                    let event = self.next_event(id)?;
                     let Some(event) = event else { break };
                     self.event(event, waiter.is_some())?;
                 }
@@ -337,6 +333,72 @@ impl Engine {
     fn wake(&self, id: Option<u64>) -> PhpResult<()> {
         let waiter = id.and_then(|id| self.waiters.borrow().get(&id).cloned());
         waiter.map_or(Ok(()), |waiter| waiter.wake())
+    }
+    fn host_waiter(&self, event: &Event) -> Option<u64> {
+        match event {
+            Event::Host { owner, .. } => owner
+                .filter(|id| self.waiters.borrow().contains_key(id))
+                .or(self.message_waiter.get()),
+            _ => None,
+        }
+    }
+    fn next_event(&self, caller: u64) -> PhpResult<Option<Event>> {
+        let index = self
+            .events
+            .borrow()
+            .iter()
+            .position(|event| self.host_waiter(event).is_none_or(|owner| owner == caller));
+        if let Some(index) = index {
+            return Ok(self.events.borrow_mut().remove(index));
+        }
+        while let Ok(event) = self.port.receive() {
+            if let Some(owner) = self.host_waiter(&event).filter(|owner| *owner != caller) {
+                self.events.borrow_mut().push_back(event);
+                self.wake(Some(owner))?;
+            } else {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+    fn finish_host(
+        &self,
+        token: u64,
+        target: worker::HostTarget,
+        args: Vec<MiddleValue>,
+    ) -> PhpResult<()> {
+        let _host = CounterGuard::enter(&self.host_calls);
+        let result = match target {
+            worker::HostTarget::Named(name) => crate::bridge::host_call(&self.state, &name, args),
+            worker::HostTarget::Function(id) => crate::bridge::php_fn_call(&self.state, id, args),
+        };
+        if let Err(error) = checked(Ok(())) {
+            self.port.close();
+            return Err(error);
+        }
+        self.send(Command::HostReply { token, result })
+    }
+    fn queue_host(
+        &self,
+        token: u64,
+        target: worker::HostTarget,
+        args: Vec<MiddleValue>,
+    ) -> PhpResult<()> {
+        let engine = self.weak.upgrade().expect("active engine");
+        let call = RefCell::new(Some((target, args)));
+        let callback = Closure::wrap(Box::new(move || -> PhpResult<()> {
+            let Some((target, args)) = call.borrow_mut().take() else {
+                return Ok(());
+            };
+            if engine.ensure_open().is_err() {
+                return Ok(());
+            }
+            engine.finish_host(token, target, args)
+        }) as Box<dyn Fn() -> PhpResult<()>>)
+        .into_zval(false)?;
+        let callback = call_php("Closure", "fromCallable", vec![&callback])?;
+        self.loop_call("queue", vec![&callback])?;
+        Ok(())
     }
     fn wake_all(&self) -> PhpResult<()> {
         let waiters = self.waiters.borrow().values().cloned().collect::<Vec<_>>();
@@ -428,24 +490,18 @@ impl Engine {
                 self.wake(Some(id))?;
             }
             Event::Host {
+                owner,
                 token,
                 target,
                 args,
             } => {
-                let _host = CounterGuard::enter(&self.host_calls);
-                let result = match target {
-                    worker::HostTarget::Named(name) => {
-                        crate::bridge::host_call(&self.state, &name, args)
-                    }
-                    worker::HostTarget::Function(id) => {
-                        crate::bridge::php_fn_call(&self.state, id, args)
-                    }
-                };
-                if let Err(error) = checked(Ok(())) {
-                    self.port.close();
-                    return Err(error);
+                if has_loop && !owner.is_some_and(|id| self.waiters.borrow().contains_key(&id)) {
+                    // Background jobs must not borrow a message consumer's
+                    // Fiber: the PHP callback may itself await that consumer.
+                    self.queue_host(token, target, args)?;
+                } else {
+                    self.finish_host(token, target, args)?;
                 }
-                self.send(Command::HostReply { token, result })?;
             }
             Event::NeedsLoop { id } => {
                 if !has_loop {
@@ -503,12 +559,21 @@ impl Engine {
                     }
                 }
                 if !engine.events.borrow().is_empty() {
-                    let waiter = engine
-                        .waiters
+                    let owner = engine
+                        .events
                         .borrow()
-                        .values()
-                        .find(|w| w.sleeping.get())
-                        .cloned();
+                        .iter()
+                        .find_map(|event| engine.host_waiter(event));
+                    let waiter = owner
+                        .and_then(|id| engine.waiters.borrow().get(&id).cloned())
+                        .or_else(|| {
+                            engine
+                                .waiters
+                                .borrow()
+                                .values()
+                                .find(|w| w.sleeping.get())
+                                .cloned()
+                        });
                     if let Some(waiter) = waiter {
                         waiter.wake()?;
                     }

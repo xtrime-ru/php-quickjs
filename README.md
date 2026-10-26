@@ -16,6 +16,9 @@ thread. PHP callbacks, objects and closures remain on the PHP thread. With
 Revolt autoloaded, waiting suspends the calling Fiber rather than the PHP thread.
 Synchronous `php.*` callbacks and `Js\Callback` keep their existing API, including
 nested calls.
+JavaScript always executes on its dedicated worker, including callbacks invoked
+from PHP. A synchronous PHP host call pauses its calling JS frame; the worker
+can continue processing ready jobs and nested callback requests while PHP runs.
 Call `$js->close()` to interrupt JS, join its worker and release PHP capabilities.
 Close live runtimes before `fork()` and create new runtimes in the child; inherited runtimes reject entries in the child.
 
