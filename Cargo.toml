@@ -23,7 +23,6 @@ rquickjs = { version = "0.14.0", default-features = false, features = [
     "macro",
     "classes",
     "array-buffer",
-    "futures",
 ] }
 serde_json = "1.0.154"
 

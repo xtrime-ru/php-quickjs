@@ -103,7 +103,7 @@ Rust converts these references without JS-side wrapping or decoding.
 
 ### Invoking a JS function from PHP
 
-`Js\Callback::__invoke` (`callback.rs`) looks up the function with `__getJsFn`,
+`Js\Callback::__invoke` (`callback.rs`) looks up the function directly in the JS registry,
 converts its arguments, invokes it, and awaits any returned Promise.
 
 The PHP wrapper holds an integer function ID and an owning engine reference;
@@ -112,8 +112,11 @@ stay on the PHP side. Owned `MiddleValue` data is `Send`; no unsafe `Send` shim 
 used to move a runtime, Zend value, context or function between threads.
 
 `worker.rs` owns the runtime and processes requests, host replies and ready jobs.
-Returned Promises are tracked independently. A synchronous host wait can process
-nested function requests, preventing PHP -> JS -> PHP deadlocks. A depth cap of
+Returned Promises are tracked by request ID; their intrinsic completion handlers
+append only ready IDs to a local queue. There is no second async executor or
+periodic polling. The worker blocks on the command channel until a command or
+the nearest execution deadline. Synchronous host waits use the same dispatcher
+and service nested function requests, preventing PHP -> JS -> PHP deadlocks. A depth cap of
 200 and inherited deadlines bound recursion. Isolated runtimes cancel remaining
 callback requests before releasing their context.
 

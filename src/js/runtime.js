@@ -12,8 +12,6 @@ if (!globalThis.__registerJsFn) {
       jsFns[id] = fn;
       return id;
     }
-    function getFn(id) { return jsFns[id]; }
-    function deleteFn(id) { delete jsFns[id]; }
     function makePhpFn(id) {
       return function () {
         return globalThis.__php_invoke(id, Array.prototype.slice.call(arguments));
@@ -21,9 +19,8 @@ if (!globalThis.__registerJsFn) {
     }
 
     globalThis.__registerJsFn = registerFn;
-    globalThis.__getJsFn = getFn;
+    Object.defineProperty(globalThis, "__jsFunctions", {value: jsFns});
     globalThis.__makePhpFn = makePhpFn;
-    globalThis.__deleteJsFn = deleteFn;
     globalThis.__asPromise = function (value) {
       return value !== null &&
         (typeof value === "object" || typeof value === "function")

@@ -89,8 +89,8 @@ pub fn js_to_middle<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<
     let result = conversion.convert(value, 0);
     if result.is_err() {
         for id in conversion.registered {
-            if let Ok(del) = ctx.globals().get::<_, Function>("__deleteJsFn") {
-                let _ = del.call::<_, ()>((id as f64,));
+            if let Ok(functions) = ctx.globals().get::<_, Object>("__jsFunctions") {
+                let _ = functions.remove(id as f64);
             }
         }
     }
@@ -239,8 +239,8 @@ pub fn middle_into_js<'js>(ctx: &Ctx<'js>, value: MiddleValue) -> rquickjs::Resu
         }
         // Reconstruct callables from the JS-side helpers.
         MiddleValue::JsFn(id) => {
-            let get: Function = ctx.globals().get("__getJsFn")?;
-            get.call((id as f64,))?
+            let functions: Object = ctx.globals().get("__jsFunctions")?;
+            functions.get(id as f64)?
         }
         MiddleValue::PhpFn(id) => {
             let make: Function = ctx.globals().get("__makePhpFn")?;

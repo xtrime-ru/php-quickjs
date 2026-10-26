@@ -12,7 +12,7 @@ use ext_php_rs::{
     zend::{ExecutorGlobals, Function as PhpFunction},
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::{HashMap, VecDeque},
     io::Read,
     rc::{Rc, Weak},
@@ -41,7 +41,7 @@ pub struct Engine {
     weak: Weak<Engine>,
 }
 struct Waiter {
-    suspension: Zval,
+    suspension: OnceCell<Zval>,
     sleeping: Cell<bool>,
 }
 unsafe extern "C" {
@@ -50,7 +50,12 @@ unsafe extern "C" {
 impl Waiter {
     fn wake(&self) -> PhpResult<()> {
         if self.sleeping.replace(false) {
-            checked(self.suspension.try_call_method("resume", vec![]))?;
+            checked(
+                self.suspension
+                    .get()
+                    .expect("sleeping waiter")
+                    .try_call_method("resume", vec![]),
+            )?;
         }
         Ok(())
     }
@@ -285,13 +290,10 @@ impl Engine {
                 "Too many pending QuickJS operations (256)".into(),
             ));
         }
-        let suspension = self
-            .loop_function("getSuspension")
-            .map(|function| checked(function.try_call(vec![])))
-            .transpose()?;
-        let waiter = suspension.map(|suspension| {
+        let get_suspension = self.loop_function("getSuspension");
+        let waiter = get_suspension.map(|_| {
             Rc::new(Waiter {
-                suspension,
+                suspension: OnceCell::new(),
                 sleeping: Cell::new(false),
             })
         });
@@ -311,9 +313,24 @@ impl Engine {
                 }
                 self.ensure_open()?;
                 if let Some(waiter) = &waiter {
+                    if waiter.suspension.get().is_none() {
+                        let suspension =
+                            checked(get_suspension.expect("event loop").try_call(vec![]))?;
+                        let _ = waiter.suspension.set(suspension);
+                    }
                     self.ensure_watcher()?;
+                    // Setup may outlive a short worker call. Drain once more before
+                    // entering Revolt; the descriptor covers a later completion.
+                    if let Some(event) = self.next_event(id)? {
+                        self.event(event, true)?;
+                        continue;
+                    }
                     waiter.sleeping.set(true);
-                    let result = waiter.suspension.try_call_method("suspend", vec![]);
+                    let result = waiter
+                        .suspension
+                        .get()
+                        .expect("initialized suspension")
+                        .try_call_method("suspend", vec![]);
                     waiter.sleeping.set(false);
                     checked(result)?;
                 } else {
@@ -451,7 +468,6 @@ impl Engine {
         Ok(())
     }
     fn request(&self, op: Operation) -> PhpResult<Zval> {
-        self.ensure_open()?;
         let id = self.next_id();
         let eval = matches!(&op, Operation::Eval { .. });
         let parent = self.active_eval.get();
@@ -558,22 +574,31 @@ impl Engine {
                         event => engine.events.borrow_mut().push_back(event),
                     }
                 }
-                if !engine.events.borrow().is_empty() {
-                    let owner = engine
+                // A single native notification can carry host calls for several
+                // Fibers. Wake every owner, otherwise the last nested host call
+                // may wait forever behind an earlier owner's queued event.
+                let owners = engine
+                    .events
+                    .borrow()
+                    .iter()
+                    .filter_map(|event| engine.host_waiter(event))
+                    .collect::<std::collections::HashSet<_>>();
+                for owner in owners {
+                    engine.wake(Some(owner))?;
+                }
+                if !engine.events.borrow().is_empty()
+                    && engine
                         .events
                         .borrow()
                         .iter()
-                        .find_map(|event| engine.host_waiter(event));
-                    let waiter = owner
-                        .and_then(|id| engine.waiters.borrow().get(&id).cloned())
-                        .or_else(|| {
-                            engine
-                                .waiters
-                                .borrow()
-                                .values()
-                                .find(|w| w.sleeping.get())
-                                .cloned()
-                        });
+                        .all(|event| engine.host_waiter(event).is_none())
+                {
+                    let waiter = engine
+                        .waiters
+                        .borrow()
+                        .values()
+                        .find(|w| w.sleeping.get())
+                        .cloned();
                     if let Some(waiter) = waiter {
                         waiter.wake()?;
                     }

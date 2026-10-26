@@ -7,48 +7,20 @@ use crate::{
     transpile::{TranspileCache, Transpiled},
 };
 use ext_php_rs::prelude::PhpException;
-use rquickjs::{
-    promise::PromiseFuture, AsyncContext, AsyncRuntime, Ctx, Exception, Function, Value,
-};
+use rquickjs::{function::This, Context, Ctx, Exception, Function, Promise, Runtime, Value};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
-    future::{poll_fn, Future},
     io::Write,
-    pin::{pin, Pin},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
-    task::{Context as TaskContext, Poll, Wake, Waker},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-
-struct WorkerWake(thread::Thread);
-impl Wake for WorkerWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-}
-fn block_on<T>(deadline: &Cell<Option<Instant>>, future: impl Future<Output = T>) -> T {
-    let waker = Waker::from(Arc::new(WorkerWake(thread::current())));
-    let mut context = TaskContext::from_waker(&waker);
-    let mut future = pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => match deadline.get() {
-                Some(deadline) => {
-                    thread::park_timeout(deadline.saturating_duration_since(Instant::now()))
-                }
-                None => thread::park(),
-            },
-        }
-    }
-}
 
 #[cfg(target_os = "linux")]
 fn notification_pair() -> std::io::Result<(File, File)> {
@@ -280,7 +252,6 @@ impl Port {
                     config,
                     token: Cell::new(0),
                     notification_pending: Cell::new(false),
-                    thread: thread::current(),
                 });
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.run(ready_tx)));
@@ -336,9 +307,6 @@ impl Port {
         self.tx
             .try_send(command)
             .map_err(|_| WireError::Internal("QuickJS command queue is full or closed".into()))?;
-        if let Some(worker) = self.worker.borrow().as_ref() {
-            worker.thread().unpark();
-        }
         Ok(())
     }
     pub fn receive(&self) -> Result<Event, mpsc::TryRecvError> {
@@ -389,7 +357,6 @@ impl Port {
         self.signals.stop.store(true, Ordering::SeqCst);
         let _ = self.tx.try_send(Command::Stop);
         if let Some(worker) = self.worker.borrow_mut().take() {
-            worker.thread().unpark();
             let _ = worker.join();
         }
     }
@@ -417,7 +384,6 @@ struct Driver {
     config: Config,
     token: Cell<u64>,
     notification_pending: Cell<bool>,
-    thread: thread::Thread,
 }
 impl Driver {
     fn notify(&self) {
@@ -483,121 +449,82 @@ impl Driver {
         first: Option<Request>,
         ready: Option<mpsc::SyncSender<Result<(), WireError>>>,
     ) -> Result<(), String> {
+        let rt = Runtime::new().map_err(|e| e.to_string())?;
+        if self.config.memory_limit > 0 {
+            rt.set_memory_limit(self.config.memory_limit);
+        }
+        if self.config.max_stack > 0 {
+            rt.set_max_stack_size(self.config.max_stack);
+        }
         let deadline = Rc::new(Cell::new(None::<Instant>));
-        let wake_deadline = deadline.clone();
-        block_on(&wake_deadline, async {
-            let rt = AsyncRuntime::new().map_err(|e| e.to_string())?;
-            if self.config.memory_limit > 0 {
-                rt.set_memory_limit(self.config.memory_limit).await;
+        let timed_out = Rc::new(Cell::new(false));
+        let interrupted = self.signals.clone();
+        let dl = deadline.clone();
+        let expired = timed_out.clone();
+        rt.set_interrupt_handler(Some(Box::new(move || {
+            if interrupted.stop.load(Ordering::SeqCst) {
+                return true;
             }
-            if self.config.max_stack > 0 {
-                rt.set_max_stack_size(self.config.max_stack).await;
+            if dl.get().is_some_and(|d| Instant::now() >= d) {
+                expired.set(true);
+                return true;
             }
-            let timed_out = Rc::new(Cell::new(false));
-            let interrupted = self.signals.clone();
-            let dl = deadline.clone();
-            let expired = timed_out.clone();
-            rt.set_interrupt_handler(Some(Box::new(move || {
-                if interrupted.stop.load(Ordering::SeqCst) {
-                    return true;
-                }
-                if dl.get().is_some_and(|d| Instant::now() >= d) {
-                    expired.set(true);
-                    return true;
-                }
-                false
-            })))
-            .await;
-            let context = AsyncContext::full(&rt).await.map_err(|e| e.to_string())?;
-            let root = first.as_ref().map(|r| r.id);
-            context
-                .async_with(async move |ctx| {
-                    let session = Rc::new(Session {
-                        driver: self.clone(),
-                        pending: RefCell::new(Vec::new()),
-                        turn_deadline: Cell::new(None),
-                        service: RefCell::new(None),
-                        service_queued: Cell::new(false),
-                        posted: RefCell::new(HashSet::new()),
-                        capacity: RefCell::new(VecDeque::new()),
-                        replies: RefCell::new(HashMap::new()),
-                        entries: RefCell::new(Vec::new()),
-                        deadline,
-                        timed_out,
-                        failed: RefCell::new(VecDeque::new()),
-                        root,
-                        root_finished: Cell::new(false),
-                        facade: RefCell::new(None),
-                        js_depth: Cell::new(0),
-                        reported_failure: Cell::new(false),
-                        active_request: Cell::new(None),
-                    });
-                    let _cleanup = SessionCleanup(session.clone());
-                    install(&ctx, session.clone()).map_err(|e| error::js_error_message(&ctx, e))?;
-                    let service = session.clone();
-                    *session.service.borrow_mut() = Some(
-                        Function::new(ctx.clone(), move || -> rquickjs::Result<()> {
-                            let ctx = service.service.borrow().as_ref().unwrap().ctx().clone();
-                            service.service_queued.set(false);
-                            service.tick(&ctx);
-                            service.schedule(&ctx);
-                            Ok(())
-                        })
-                        .map_err(|e| error::js_error_message(&ctx, e))?,
-                    );
-                    if let Some(ready) = ready {
-                        let _ = ready.send(Ok(()));
-                    }
-                    if let Some(first) = first {
-                        session.request(&ctx, first);
-                    }
-                    let mut turn = None;
-                    poll_fn(|_| {
-                        drop(turn.take());
-                        loop {
-                            if !session.tick(&ctx) {
-                                return Poll::Ready(());
-                            }
-                            if session.has_awaitable() {
-                                session.schedule(&ctx);
-                                if !jobs_pending(&ctx) {
-                                    session.ask_loop();
-                                }
-                                self.flush_notifications();
-                                turn = Some(session.enter(session.deadline.get(), true));
-                                return Poll::Pending;
-                            }
-                            // No async work: block on the command channel without spinning
-                            // or implicitly draining jobs requested through the manual API.
-                            self.flush_notifications();
-                            match self.commands.recv() {
-                                Ok(command) => {
-                                    if !session.command(&ctx, command) {
-                                        return Poll::Ready(());
-                                    }
-                                }
-                                _ => return Poll::Ready(()),
-                            }
-                        }
-                    })
-                    .await;
-                    let pending = std::mem::take(&mut *session.pending.borrow_mut());
-                    for item in pending {
-                        self.emit(Event::Done {
-                            id: item.id,
-                            result: Err(WireError::Internal(
-                                if self.signals.stop.load(Ordering::SeqCst) {
-                                    "QuickJS worker is closed".into()
-                                } else {
-                                    "JS callback canceled: owning isolated eval ended".into()
-                                },
-                            )),
-                        });
-                    }
-                    session.replies.borrow_mut().clear();
-                    Ok(())
-                })
-                .await
+            false
+        })));
+        let context = Context::full(&rt).map_err(|e| e.to_string())?;
+        let root = first.as_ref().map(|r| r.id);
+        context.with(|ctx| {
+            let promise: rquickjs::Object =
+                ctx.globals().get("Promise").map_err(|e| e.to_string())?;
+            let prototype: rquickjs::Object =
+                promise.get("prototype").map_err(|e| e.to_string())?;
+            let then: Function = prototype.get("then").map_err(|e| e.to_string())?;
+            let session = Rc::new(Session {
+                driver: self.clone(),
+                pending: RefCell::new(HashMap::new()),
+                ready: Rc::new(RefCell::new(VecDeque::new())),
+                then: RefCell::new(Some(then)),
+                deferred_ready: RefCell::new(Vec::new()),
+                turn_deadline: Cell::new(None),
+                posted: RefCell::new(HashSet::new()),
+                capacity: RefCell::new(VecDeque::new()),
+                replies: RefCell::new(HashMap::new()),
+                entries: RefCell::new(Vec::new()),
+                deadline,
+                timed_out,
+                failed: RefCell::new(VecDeque::new()),
+                root,
+                root_finished: Cell::new(false),
+                facade: RefCell::new(None),
+                functions: RefCell::new(None),
+                js_depth: Cell::new(0),
+                reported_failure: Cell::new(false),
+                active_request: Cell::new(None),
+            });
+            let _cleanup = SessionCleanup(session.clone());
+            install(&ctx, session.clone()).map_err(|e| error::js_error_message(&ctx, e))?;
+            if let Some(ready) = ready {
+                let _ = ready.send(Ok(()));
+            }
+            if let Some(first) = first {
+                session.request(&ctx, first);
+            }
+            while session.step(&ctx, None) {}
+            let pending = std::mem::take(&mut *session.pending.borrow_mut());
+            for (id, _) in pending {
+                self.emit(Event::Done {
+                    id,
+                    result: Err(WireError::Internal(
+                        if self.signals.stop.load(Ordering::SeqCst) {
+                            "QuickJS worker is closed".into()
+                        } else {
+                            "JS callback canceled: owning isolated eval ended".into()
+                        },
+                    )),
+                });
+            }
+            session.replies.borrow_mut().clear();
+            Ok(())
         })
     }
 }
@@ -609,7 +536,7 @@ struct ErrorContext {
 struct Pending<'js> {
     id: u64,
     parent: Option<u64>,
-    future: RefCell<PromiseFuture<'js, Value<'js>>>,
+    promise: Promise<'js>,
     context: ErrorContext,
     deadline: Option<Instant>,
     asked: Cell<bool>,
@@ -617,10 +544,11 @@ struct Pending<'js> {
 }
 struct Session<'js> {
     driver: Rc<Driver>,
-    pending: RefCell<Vec<Rc<Pending<'js>>>>,
+    pending: RefCell<HashMap<u64, Rc<Pending<'js>>>>,
+    ready: Rc<RefCell<VecDeque<u64>>>,
+    then: RefCell<Option<Function<'js>>>,
+    deferred_ready: RefCell<Vec<u64>>,
     turn_deadline: Cell<Option<Instant>>,
-    service: RefCell<Option<Function<'js>>>,
-    service_queued: Cell<bool>,
     posted: RefCell<HashSet<u64>>,
     capacity: RefCell<VecDeque<(u64, Option<u64>)>>,
     replies: RefCell<HashMap<u64, Option<Result<Data, HostError>>>>,
@@ -631,6 +559,7 @@ struct Session<'js> {
     root: Option<u64>,
     root_finished: Cell<bool>,
     facade: RefCell<Option<rquickjs::Object<'js>>>,
+    functions: RefCell<Option<rquickjs::Object<'js>>>,
     js_depth: Cell<usize>,
     reported_failure: Cell<bool>,
     active_request: Cell<Option<u64>>,
@@ -653,6 +582,10 @@ impl Drop for JsEntry<'_, '_> {
     fn drop(&mut self) {
         if self.depth {
             self.session.js_depth.set(self.session.js_depth.get() - 1);
+            let deferred = std::mem::take(&mut *self.session.deferred_ready.borrow_mut());
+            if !deferred.is_empty() {
+                self.session.ready.borrow_mut().extend(deferred);
+            }
         }
         if self.budget {
             self.session.entries.borrow_mut().pop();
@@ -664,7 +597,10 @@ impl Drop for SessionCleanup<'_> {
     fn drop(&mut self) {
         self.0.pending.borrow_mut().clear();
         self.0.facade.borrow_mut().take();
-        self.0.service.borrow_mut().take();
+        self.0.functions.borrow_mut().take();
+        self.0.then.borrow_mut().take();
+        self.0.ready.borrow_mut().clear();
+        self.0.deferred_ready.borrow_mut().clear();
     }
 }
 fn jobs_pending(ctx: &Ctx<'_>) -> bool {
@@ -714,7 +650,7 @@ impl<'js> Session<'js> {
         self.deadline.set(if entries.is_empty() {
             self.pending
                 .borrow()
-                .iter()
+                .values()
                 .filter_map(|p| p.deadline)
                 .min()
                 .or(self.turn_deadline.get())
@@ -738,7 +674,7 @@ impl<'js> Session<'js> {
         }
     }
     fn finish(&self, id: u64, result: Result<Data, WireError>) {
-        self.pending.borrow_mut().retain(|p| p.id != id);
+        self.pending.borrow_mut().remove(&id);
         if result.is_err() {
             let mut failed = self.failed.borrow_mut();
             failed.push_back(id);
@@ -747,7 +683,7 @@ impl<'js> Session<'js> {
             }
             drop(failed);
             let mut canceled = Vec::new();
-            self.pending.borrow_mut().retain(|p| {
+            self.pending.borrow_mut().retain(|_, p| {
                 if p.parent == Some(id) {
                     canceled.push(p.id);
                     false
@@ -812,18 +748,27 @@ impl<'js> Session<'js> {
         }
         true
     }
-    fn step(&self, ctx: &Ctx<'js>) -> Result<bool, mpsc::RecvError> {
+    fn wait(&self, ctx: &Ctx<'js>) -> bool {
         self.driver.flush_notifications();
-        let command = if jobs_pending(ctx) && self.has_awaitable() {
-            self.driver.commands.try_recv().ok()
-        } else {
-            match self.driver.commands.recv_timeout(Duration::from_millis(5)) {
-                Ok(command) => Some(command),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
-            }
+        if !self.ready.borrow().is_empty() {
+            return true;
+        }
+        let command = match self.deadline.get() {
+            Some(deadline) => match self
+                .driver
+                .commands
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => return true,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            },
+            None => match self.driver.commands.recv() {
+                Ok(command) => command,
+                Err(_) => return false,
+            },
         };
-        Ok(command.is_none_or(|command| self.command(ctx, command)))
+        self.command(ctx, command)
     }
     fn request(&self, ctx: &Ctx<'js>, request: Request) {
         let _owner = RequestScope(
@@ -868,7 +813,7 @@ impl<'js> Session<'js> {
                 .chain(
                     self.pending
                         .borrow()
-                        .iter()
+                        .values()
                         .filter(|p| Some(p.id) == parent)
                         .filter_map(|p| p.deadline),
                 )
@@ -919,15 +864,26 @@ impl<'js> Session<'js> {
                     if let Some(result) = promise.result::<Value>() {
                         return result.map(Some);
                     }
-                    self.pending.borrow_mut().push(Rc::new(Pending {
+                    self.pending.borrow_mut().insert(
                         id,
-                        parent,
-                        future: RefCell::new(promise.into_future()),
-                        context: context.clone(),
-                        deadline,
-                        asked: Cell::new(false),
-                        settle_depth: self.js_depth.get() - 1,
-                    }));
+                        Rc::new(Pending {
+                            id,
+                            parent,
+                            promise: promise.clone(),
+                            context: context.clone(),
+                            deadline,
+                            asked: Cell::new(false),
+                            settle_depth: self.js_depth.get() - 1,
+                        }),
+                    );
+                    let ready = self.ready.clone();
+                    let notify = Function::new(ctx.clone(), move || {
+                        ready.borrow_mut().push_back(id);
+                    })?;
+                    // Observe the native Promise with the pristine intrinsic,
+                    // without a Rust executor or guest-overridable .then lookup.
+                    let then = self.then.borrow().as_ref().unwrap().clone();
+                    then.call::<_, ()>((This(promise), notify.clone(), notify))?;
                     return Ok(None);
                 }
             }
@@ -947,9 +903,9 @@ impl<'js> Session<'js> {
     ) -> Result<(Value<'js>, ErrorContext), WireError> {
         let prep = (|| -> rquickjs::Result<()> {
             if !deletions.is_empty() {
-                let delete: Function = ctx.globals().get("__deleteJsFn")?;
+                let functions = self.functions.borrow().as_ref().unwrap().clone();
                 for id in deletions {
-                    delete.call::<_, ()>((*id as f64,))?;
+                    functions.remove(*id as f64)?;
                 }
             }
             if names.is_none() && !matches!(&op, Operation::Eval { .. }) {
@@ -998,8 +954,8 @@ impl<'js> Session<'js> {
             }
             Operation::Call { id, args, .. } => {
                 let result = (|| {
-                    let get: Function = ctx.globals().get("__getJsFn")?;
-                    let function: Function = get.call((id as f64,))?;
+                    let function: Function =
+                        self.functions.borrow().as_ref().unwrap().get(id as f64)?;
                     let mut call_args = rquickjs::function::Args::new(ctx.clone(), args.len());
                     for arg in args {
                         call_args.push_arg(middle_into_js(ctx, arg)?)?;
@@ -1049,87 +1005,79 @@ impl<'js> Session<'js> {
         Ok(result > 0)
     }
     fn settle(&self, ctx: &Ctx<'js>) {
-        // Release collection borrows before polling: Promise.then may enter PHP
-        // and recursively add, cancel or settle another callback.
-        let pending = self.pending.borrow().clone();
-        for item in pending {
+        if self.pending.borrow().is_empty() {
+            self.ready.borrow_mut().clear();
+            return;
+        }
+        let ready = std::mem::take(&mut *self.ready.borrow_mut());
+        for id in ready {
+            let item = self.pending.borrow().get(&id).cloned();
+            let Some(item) = item else { continue };
             if item.settle_depth < self.js_depth.get() {
+                self.deferred_ready.borrow_mut().push(id);
                 continue;
             }
-            let Ok(mut future) = item.future.try_borrow_mut() else {
-                continue;
-            };
-            let result = if item.deadline.is_some_and(|d| Instant::now() >= d) {
-                None
-            } else {
-                let Poll::Ready(result) =
-                    Pin::new(&mut *future).poll(&mut TaskContext::from_waker(Waker::noop()))
-                else {
-                    continue;
-                };
-                Some(result)
-            };
-            if self.pending.borrow().iter().any(|p| p.id == item.id) {
-                match result {
-                    Some(result) => self.finish_value(item.id, ctx, result, &item.context),
-                    None => self.finish(item.id, Err(WireError::Timeout)),
-                }
+            if let Some(result) = item.promise.result::<Value>() {
+                self.finish_value(id, ctx, result, &item.context);
+            }
+        }
+        if self.driver.config.timeout_ms > 0 {
+            let expired = self
+                .pending
+                .borrow()
+                .values()
+                .filter(|p| p.deadline.is_some_and(|d| Instant::now() >= d))
+                .map(|p| p.id)
+                .collect::<Vec<_>>();
+            for id in expired {
+                self.finish(id, Err(WireError::Timeout));
             }
         }
         self.update_deadline();
     }
-    fn tick(&self, ctx: &Ctx<'js>) -> bool {
+    fn step(&self, ctx: &Ctx<'js>, host: Option<u64>) -> bool {
         if self.driver.signals.stop.load(Ordering::SeqCst) || self.root_finished.get() {
             return false;
         }
         let had_pending = !self.pending.borrow().is_empty();
         self.settle(ctx);
-        if self.root_finished.get() {
-            return false;
-        }
         if self.timed_out.replace(false) && !had_pending {
             self.driver.signals.pump.store(false, Ordering::SeqCst);
             self.driver.emit(Event::AsyncError(WireError::Timeout));
         }
-        for index in 0..64 {
-            let command = self.driver.commands.try_recv().ok();
-            let Some(command) = command else { break };
-            if !self.command(ctx, command) || self.root_finished.get() {
-                return false;
+        // Commands are JS turns. Checkpoint their microtasks before admitting
+        // another command, but bound the batch so an infinite chain cannot
+        // starve PHP replies, cancellation or close.
+        for _ in 0..64 {
+            if !self.has_awaitable()
+                || !jobs_pending(ctx)
+                || self.root_finished.get()
+                || self.driver.signals.stop.load(Ordering::SeqCst)
+            {
+                break;
             }
-            if index == 63 {
-                // Notifications coalesce. A full quantum may leave commands
-                // queued even when no JS jobs can wake the executor again.
-                self.driver.thread.unpark();
-            }
+            self.advance(ctx);
+        }
+        if self.root_finished.get() || self.driver.signals.stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.settle(ctx);
+        // A nested job may consume an ancestor's reply. Do not sleep after
+        // that reply has become ready on this same worker thread.
+        if host.is_some_and(|id| self.replies.borrow().get(&id).is_some_and(Option::is_some)) {
+            return true;
         }
         self.driver.flush_notifications();
-        !self.driver.signals.stop.load(Ordering::SeqCst) && !self.root_finished.get()
-    }
-    fn schedule(&self, ctx: &Ctx<'js>) {
-        if self.driver.signals.stop.load(Ordering::SeqCst) || self.root_finished.get() {
-            return;
-        }
-        if jobs_pending(ctx) {
-            if self.turn_deadline.get().is_none() && self.driver.config.timeout_ms > 0 {
-                self.turn_deadline.set(Some(
-                    Instant::now() + Duration::from_millis(self.driver.config.timeout_ms),
-                ));
-                self.update_deadline();
-            }
-            if !self.service_queued.replace(true) {
-                if let Err(error) = self.service.borrow().as_ref().unwrap().defer(()) {
-                    self.service_queued.set(false);
-                    self.driver.emit(Event::Fatal(self.error(
-                        ctx,
-                        error,
-                        &ErrorContext::default(),
-                    )));
+        match self.driver.commands.try_recv() {
+            Ok(command) => self.command(ctx, command),
+            Err(mpsc::TryRecvError::Disconnected) => false,
+            Err(mpsc::TryRecvError::Empty) => {
+                if self.has_awaitable() && jobs_pending(ctx) {
+                    return true;
                 }
+                self.ask_loop();
+                self.wait(ctx)
             }
-        } else {
-            self.turn_deadline.set(None);
-            self.update_deadline();
         }
     }
     fn has_awaitable(&self) -> bool {
@@ -1137,7 +1085,7 @@ impl<'js> Session<'js> {
             || self
                 .pending
                 .borrow()
-                .iter()
+                .values()
                 .any(|p| p.settle_depth >= self.js_depth.get())
     }
     fn advance(&self, ctx: &Ctx<'js>) {
@@ -1145,10 +1093,20 @@ impl<'js> Session<'js> {
         if !self.has_awaitable() {
             return;
         }
+        if !jobs_pending(ctx) {
+            self.turn_deadline.set(None);
+            return;
+        }
+        if self.turn_deadline.get().is_none() && self.driver.config.timeout_ms > 0 {
+            self.turn_deadline.set(Some(
+                Instant::now() + Duration::from_millis(self.driver.config.timeout_ms),
+            ));
+            self.update_deadline();
+        }
         let (id, context) = self
             .pending
             .borrow()
-            .iter()
+            .values()
             .find(|p| p.settle_depth >= self.js_depth.get())
             .map(|p| (Some(p.id), p.context.clone()))
             .unwrap_or_default();
@@ -1161,13 +1119,17 @@ impl<'js> Session<'js> {
                 self.driver.emit(Event::AsyncError(error));
             }
         }
+        if !jobs_pending(ctx) {
+            self.turn_deadline.set(None);
+        }
         self.settle(ctx);
     }
     fn ask_loop(&self) {
         for pending in self
             .pending
             .borrow()
-            .iter()
+            .values()
+            .filter(|p| p.settle_depth >= self.js_depth.get())
             .filter(|p| !p.asked.replace(true))
         {
             self.driver.emit(Event::NeedsLoop { id: pending.id });
@@ -1217,11 +1179,8 @@ impl<'js> Session<'js> {
                     Err(error) => Err(error::throw_host_error(ctx, &error)),
                 };
             }
-            self.advance(ctx);
-            match self.step(ctx) {
-                Ok(true) => {}
-                Ok(false) => return Err(Exception::throw_internal(ctx, "QuickJS worker closed")),
-                Err(_) => return Err(Exception::throw_internal(ctx, "PHP receiver closed")),
+            if !self.step(ctx, Some(token)) {
+                return Err(Exception::throw_internal(ctx, "QuickJS worker closed"));
             }
         })();
         self.replies.borrow_mut().remove(&token);
@@ -1292,5 +1251,6 @@ fn install<'js>(ctx: &Ctx<'js>, session: Rc<Session<'js>>) -> rquickjs::Result<(
     ctx.globals().set("quickjs", quickjs)?;
     ctx.eval::<(),_>("Object.freeze(globalThis.quickjs); Object.defineProperty(globalThis,'quickjs',{value:quickjs,writable:false,configurable:false})")?;
     ctx.eval::<(), _>(RUNTIME_JS)?;
+    *session.functions.borrow_mut() = Some(ctx.globals().get("__jsFunctions")?);
     Ok(())
 }
