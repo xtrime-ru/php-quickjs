@@ -127,7 +127,8 @@ extension=/var/task/quickjs.so
 Requires Rust 1.97+, clang, and PHP 8.4/8.5 dev headers (`php-config`).
 
 ```sh
-git clone https://github.com/eddmann/php-quickjs && cd php-quickjs
+git clone https://github.com/xtrime-ru/php-quickjs && cd php-quickjs
+# Check out a revision containing the worker before building.
 export PHP="$(command -v php)" PHP_CONFIG="$(command -v php-config)"
 cargo build --release # -> target/release/libphp_quickjs.so (or .dylib on macOS)
 cargo test --lib

@@ -87,10 +87,10 @@ typed capabilities, `dts()`, isolated realms — in [`examples/`](examples):
 
 ## Installation
 
-Prebuilt binaries are attached to each
-[release](https://github.com/eddmann/php-quickjs/releases) for PHP 8.4 / 8.5 —
-self-hosted Linux, AWS Lambda (a ready Bref layer), and macOS (Apple Silicon). Enable
-the one matching your platform:
+Upstream [releases](https://github.com/eddmann/php-quickjs/releases) provide binaries
+for PHP 8.4 / 8.5 on Linux, AWS Lambda and macOS (Apple Silicon). Those binaries may
+not include the worker described here; build this fork at a worker revision when it is
+required. Enable the binary matching your platform:
 
 ```ini
 ; php.ini
@@ -101,7 +101,8 @@ Or build from source (Rust 1.97+, clang, PHP dev headers — a plain cargo `cdyl
 `phpize`):
 
 ```sh
-git clone https://github.com/eddmann/php-quickjs && cd php-quickjs
+git clone https://github.com/xtrime-ru/php-quickjs && cd php-quickjs
+# Check out a revision containing the worker before building.
 make release
 ```
 
@@ -119,11 +120,63 @@ The repository is mounted at `/workspace`; Cargo output stays in
 
 ## How it works
 
+```mermaid
+%%{init: {"theme":"base","themeCSS":".cluster-label text { fill:#c4c7c5 !important; } .edgeLabel .background { fill:#121212 !important; opacity:1 !important; }","htmlLabels":false,"markdownAutoWrap":false,"themeVariables":{"darkMode":true,"primaryTextColor":"#e6e1e5","textColor":"#e6e1e5","fontFamily":"system-ui, sans-serif","fontSize":"15px","lineColor":"#9aa0ab","edgeLabelBackground":"#121212","clusterBkg":"#1a1c20","clusterBorder":"#35383e"},"flowchart":{"htmlLabels":false,"curve":"linear","rankSpacing":45,"nodeSpacing":32}}}%%
+flowchart TB
+    subgraph Canvas[" "]
+        direction TB
+        subgraph PHP["PHP THREAD"]
+            direction TB
+            API("PHP API")
+            Loop("Revolt event loop")
+            Fiber("Waiting Fiber")
+        end
+        Cmd["Command queue"]
+        subgraph Worker["QUICKJS WORKER THREAD"]
+            direction TB
+            Driver("Worker loop")
+            Compiler("Oxc compiler")
+            JS("QuickJS runtime")
+            Jobs("Promise jobs")
+            Driver -->|"TypeScript"| Compiler
+            Compiler -->|"JavaScript"| JS
+            Driver -->|"execute"| JS
+            JS -->|"microtasks"| Jobs
+        end
+        Events["Event queue"]
+        Messages["Message queue"]
+        API -->|"eval · JS callback"| Cmd
+        Cmd -->|"Request"| Driver
+        JS -->|"Done · Messages"| Events
+        Jobs -->|"Promise settled"| Events
+        JS -->|"postMessage"| Messages
+        Events -->|"native notification"| Loop
+        Loop -->|"result / error"| Fiber
+        Messages -->|"await / drain"| Fiber
+    end
+    style Canvas fill:#121212,stroke:#121212,stroke-width:80px,rx:12,ry:12
+    style PHP fill:#171e2b,stroke:#486185,rx:8,ry:8
+    style Worker fill:#1a1c20,stroke:#35383e,rx:8,ry:8
+    classDef host fill:#1e293b,stroke:#486185,color:#dbeafe,stroke-width:1.5px
+    classDef worker fill:#1c302c,stroke:#41685a,color:#d1fae5,stroke-width:1.5px
+    classDef queue fill:#302b23,stroke:#786746,color:#fef3c7,stroke-width:1.5px
+    class API,Loop,Fiber host
+    class Driver,Compiler,JS,Jobs worker
+    class Cmd,Events,Messages queue
+
 ```
-PHP (trusted)  ──ext-php-rs──►  Rust bridge  ──rquickjs──►  QuickJS (untrusted)
-   register()                  dispatch table                php.module.fn()
-   eval()                      __host(name, args)            frozen php.* facade
-```
+
+1. PHP sends an evaluation, JS callback or PHP callback reply through the **command
+   queue**. Only owned, typed values cross threads; PHP objects and closures remain
+   on the PHP thread.
+2. The worker executes JS and ready Promise jobs. Pending Promises stay associated
+   with their request IDs. A synchronous PHP call pauses its JS frame while the
+   worker can process ready jobs and nested JS callbacks.
+3. Results, errors and PHP call requests travel through the **event queue**. A native
+   readiness notification wakes Revolt, which resumes the appropriate waiting Fiber.
+   Without Revolt, PHP waits synchronously. Synchronization uses no periodic polling.
+4. `quickjs.postMessage()` writes snapshots to a separate, bounded **message queue**;
+   PHP consumes them with `drainMessages()` or `awaitMessages()`.
 
 Registered PHP capabilities go through one direct native entry point and a flat
 dispatch table; the namespaced `php.*` tree is frozen JS built from your
@@ -136,9 +189,9 @@ ways with TS source locations.
 
 ## Asynchronous execution
 
-`eval()` and `Js\Callback` automatically await returned Promises. External I/O
-yields through Revolt using php-tokio's Fiber model; rejections become PHP
-exceptions. Manual job APIs remain available for detached work. See
+`eval()` and `Js\Callback` automatically await returned Promises. With Revolt
+autoloaded, waits suspend the calling Fiber and worker notifications resume it;
+rejections become PHP exceptions. Manual job APIs remain available for detached work. See
 [asynchronous execution](docs/async.md).
 
 Async consumers can send data-only notifications with `quickjs.postMessage(value)`
