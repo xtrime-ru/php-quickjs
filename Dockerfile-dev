@@ -1,6 +1,6 @@
 FROM composer:2 AS composer
 
-FROM php:8.5-cli-bookworm
+FROM php:8.5-cli-trixie
 
 ARG RUST_VERSION=1.99.1
 
